@@ -1,3 +1,4 @@
+#api OPENGL
 #type VERTEX
 #version 330 core
 
@@ -59,5 +60,20 @@ void main()
 	upsample += (b+d+f+h)*2.0;
 	upsample += (a+c+g+i);
 	upsample *= 1.0 / 16.0;
+}
+
+#api DX12
+cbuffer PostConstants : register(b0) { float4 Params; float4 EffectParams; };
+Texture2D SourceTexture : register(t0);
+SamplerState LinearSampler : register(s0);
+struct PSInput { float4 position : SV_POSITION; float2 uv : TEXCOORD; };
+float4 PSMain(PSInput input) : SV_TARGET
+{
+  float3 result = 0;
+  for (int y = -1; y <= 1; ++y)
+    for (int x = -1; x <= 1; ++x)
+      result += SourceTexture.Sample(LinearSampler, input.uv + float2(x, y) * Params.x).rgb
+        * float((x == 0 ? 2 : 1) * (y == 0 ? 2 : 1));
+  return float4(result / 16.0f, 1);
 }
 

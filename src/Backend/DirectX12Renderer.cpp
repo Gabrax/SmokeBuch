@@ -2,6 +2,8 @@
 
 #if defined(GABGL_ENABLE_DX12) && defined(_WIN32)
 
+#include "DirectX12ShadowMath.h"
+
 #include "AudioManager.h"
 #include "Camera.h"
 #include "DeltaTime.hpp"
@@ -40,6 +42,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -55,7 +58,9 @@ namespace
 {
   constexpr uint32_t FrameCount = 2;
   constexpr uint32_t MaxDescriptors = 2048;
-  constexpr uint32_t MaxSceneLights = 32;
+  constexpr uint32_t MaxSceneLights = 128;
+  constexpr uint32_t BloomMipCount = 6;
+  constexpr uint32_t MaxHiZMips = 16;
   constexpr uint32_t MaxShadowedPointLights = 4;
   constexpr uint32_t PointShadowFaceCount = 6;
   constexpr float PointShadowRadius = 20.0f;
@@ -63,13 +68,13 @@ namespace
   constexpr uint64_t UIVertexBufferBytes = 8ull * 1024ull * 1024ull;
   constexpr uint32_t SceneRTVIndex = FrameCount;
   constexpr uint32_t BloomARTVIndex = FrameCount + 1;
-  constexpr uint32_t BloomBRTVIndex = FrameCount + 2;
   constexpr uint32_t PostProcessRTVIndex = FrameCount + 3;
   constexpr uint32_t SceneResultRTVIndex = FrameCount + 4;
   constexpr uint32_t GPositionRTVIndex = FrameCount + 5;
   constexpr uint32_t GNormalRTVIndex = FrameCount + 6;
   constexpr uint32_t GAlbedoSpecRTVIndex = FrameCount + 7;
   constexpr uint32_t PointShadowRTVBaseIndex = FrameCount + 8;
+  constexpr uint32_t BloomMipRTVBase = PointShadowRTVBaseIndex + MaxShadowedPointLights * PointShadowFaceCount;
   constexpr DXGI_FORMAT BackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
   constexpr DXGI_FORMAT SceneColorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
   constexpr DXGI_FORMAT DepthFormat = DXGI_FORMAT_D32_FLOAT;
@@ -122,14 +127,8 @@ namespace
     std::array<glm::vec4, MaxSceneLights> LightTypes{};
     glm::uvec4 LightCount{0};
     glm::vec4 Resolution{1.0f};
-  };
-
-  struct alignas(256) ShadowConstants
-  {
-    glm::mat4 LightViewProjection{1.0f};
-    glm::mat4 Model{1.0f};
-    std::array<glm::mat4, MAX_BONES> Bones{};
-    glm::vec4 Animated{0.0f};
+    glm::uvec4 MaterialIndices{0};
+    glm::vec4 ShadowFilter{0};
   };
 
   struct alignas(256) SkyboxConstants
@@ -158,12 +157,40 @@ namespace
     glm::vec4 Color{0.15f, 1.0f, 0.35f, 1.0f};
   };
 
-  struct alignas(256) PointShadowConstants
+  // ExecuteIndirect reads these fields in signature order, with a 64-byte stride.
+  struct IndirectDraw
   {
-    glm::mat4 LightViewProjection{1.0f};
-    glm::mat4 Model{1.0f};
-    std::array<glm::mat4, MAX_BONES> Bones{};
-    glm::vec4 LightPositionAndAnimated{0.0f};
+    D3D12_GPU_VIRTUAL_ADDRESS Constants;
+    D3D12_VERTEX_BUFFER_VIEW Vertex;
+    D3D12_INDEX_BUFFER_VIEW Index;
+    D3D12_DRAW_INDEXED_ARGUMENTS Draw;
+    uint32_t Padding = 0;
+  };
+  static_assert(sizeof(IndirectDraw) == 64);
+  static_assert(offsetof(IndirectDraw, Draw) == 40);
+
+  struct DrawCullData
+  {
+    glm::vec4 Sphere;
+    glm::uvec4 Instances; // source start, count, output start, allow occlusion
+  };
+
+  struct PointShadowCacheEntry
+  {
+    uint64_t CasterHash = 0;
+    glm::vec3 LightPosition{0};
+    uint32_t LightIndex = 0;
+    bool Valid = false;
+  };
+
+  struct GPUFrameData
+  {
+    ComPtr<ID3D12Resource> Commands, Transforms, Count, StatisticsReadback;
+    uint64_t CommandBytes = 0, TransformBytes = 0;
+    D3D12_GPU_VIRTUAL_ADDRESS SourceCommands = 0, SourceTransforms = 0, CullData = 0;
+    uint32_t DrawCount = 0;
+    uint32_t RenderableInstances = 0;
+    bool Culled = false, StatisticsReady = false;
   };
 
   struct FrameUploadData
@@ -201,10 +228,19 @@ namespace
     ComPtr<ID3D12RootSignature> SceneRootSignature;
     ComPtr<ID3D12PipelineState> ScenePipeline;
     ComPtr<ID3D12PipelineState> LightingPipeline;
-    ComPtr<ID3D12RootSignature> ShadowRootSignature;
-    ComPtr<ID3D12PipelineState> ShadowPipeline;
-    ComPtr<ID3D12RootSignature> PointShadowRootSignature;
-    ComPtr<ID3D12PipelineState> PointShadowPipeline;
+    ComPtr<ID3D12PipelineState> DepthPrepassPipeline;
+    ComPtr<ID3D12PipelineState> GPUShadowPipeline, GPUPointShadowPipeline;
+    ComPtr<ID3D12RootSignature> CullRootSignature, HiZRootSignature, TileRootSignature;
+    ComPtr<ID3D12PipelineState> CullPipeline, HiZPipeline, TilePipeline;
+    ComPtr<ID3D12CommandSignature> DrawSignature;
+    std::array<GPUFrameData, FrameCount> GPUFrames;
+    GPUTexture HiZ;
+    uint32_t DepthDescriptor = 0, HiZUAVBase = 0, HiZSRVBase = 0, HiZMipCount = 0;
+    ComPtr<ID3D12Resource> TileGrid, TileIndices;
+    ComPtr<ID3D12Resource> ShadowOffsets;
+    uint32_t TileCountX = 0, TileCountY = 0;
+    std::array<GPUTexture, BloomMipCount> BloomMips;
+    ComPtr<ID3D12PipelineState> BloomDownsamplePipeline, BloomUpsamplePipeline;
     ComPtr<ID3D12RootSignature> SkyboxRootSignature;
     ComPtr<ID3D12PipelineState> SkyboxPipeline;
     ComPtr<ID3D12RootSignature> ParticleRootSignature;
@@ -215,7 +251,6 @@ namespace
     ComPtr<ID3D12PipelineState> PhysicsDebugPipeline;
     ComPtr<ID3D12RootSignature> PostRootSignature;
     ComPtr<ID3D12PipelineState> BloomExtractPipeline;
-    ComPtr<ID3D12PipelineState> BloomBlurPipeline;
     ComPtr<ID3D12PipelineState> CompositePipeline;
     ComPtr<ID3D12PipelineState> PostProcessPipeline;
     ComPtr<ID3D12RootSignature> UIRootSignature;
@@ -231,7 +266,6 @@ namespace
     GPUTexture GNormal;
     GPUTexture GAlbedoSpec;
     GPUTexture BloomA;
-    GPUTexture BloomB;
     GPUTexture PostProcessColor;
     GPUTexture ShadowMap;
     GPUTexture PointShadowMap;
@@ -247,6 +281,7 @@ namespace
     std::vector<UIBatch> PendingUIBatches;
     std::vector<DebugLineVertex> PendingDebugLines;
     std::vector<uint32_t> PointShadowLightIndices;
+    std::array<PointShadowCacheEntry, MaxShadowedPointLights> PointShadowCache;
     std::vector<RenderModelPreview> ModelPreviews;
     uint32_t NextDescriptor = 0;
     uint32_t ImGuiFontDescriptor = std::numeric_limits<uint32_t>::max();
@@ -262,6 +297,7 @@ namespace
     uint32_t SRVDescriptorSize = 0;
     bool TearingSupported = false;
     bool FrameStarted = false;
+    bool FrameFailed = false;
     bool ShadowMapReadable = false;
     bool PointShadowMapReadable = false;
     bool ImGuiInitialized = false;
@@ -457,7 +493,7 @@ namespace
     depthDesc.Height = height;
     depthDesc.DepthOrArraySize = 1;
     depthDesc.MipLevels = 1;
-    depthDesc.Format = DepthFormat;
+    depthDesc.Format = DXGI_FORMAT_R32_TYPELESS;
     depthDesc.SampleDesc.Count = 1;
     depthDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -480,13 +516,14 @@ namespace
       s_Data.DepthBuffer.Get(), &viewDesc, GetDSVHandle(0));
   }
 
+  void CreateGPUResources(uint32_t width, uint32_t height);
+
   void CreatePostProcessResources(uint32_t width, uint32_t height)
   {
     if (s_Data.SceneColor.DescriptorIndex == 0)
     {
       s_Data.SceneColor.DescriptorIndex = AllocateDescriptor();
       s_Data.BloomA.DescriptorIndex = AllocateDescriptor();
-      s_Data.BloomB.DescriptorIndex = AllocateDescriptor();
       s_Data.PostProcessColor.DescriptorIndex = AllocateDescriptor();
       s_Data.SceneResult.DescriptorIndex = AllocateDescriptor();
       s_Data.GPosition.DescriptorIndex = AllocateDescriptor();
@@ -495,17 +532,22 @@ namespace
     }
     const uint32_t sceneDescriptor = s_Data.SceneColor.DescriptorIndex;
     const uint32_t bloomADescriptor = s_Data.BloomA.DescriptorIndex;
-    const uint32_t bloomBDescriptor = s_Data.BloomB.DescriptorIndex;
     const uint32_t postProcessDescriptor = s_Data.PostProcessColor.DescriptorIndex;
     const uint32_t sceneResultDescriptor = s_Data.SceneResult.DescriptorIndex;
     const uint32_t gPositionDescriptor = s_Data.GPosition.DescriptorIndex;
     const uint32_t gNormalDescriptor = s_Data.GNormal.DescriptorIndex;
     const uint32_t gAlbedoSpecDescriptor = s_Data.GAlbedoSpec.DescriptorIndex;
     s_Data.SceneColor = CreateColorTarget(width, height, SceneRTVIndex, sceneDescriptor);
-    const uint32_t bloomWidth = std::max(1u, width / 2u);
-    const uint32_t bloomHeight = std::max(1u, height / 2u);
-    s_Data.BloomA = CreateColorTarget(bloomWidth, bloomHeight, BloomARTVIndex, bloomADescriptor);
-    s_Data.BloomB = CreateColorTarget(bloomWidth, bloomHeight, BloomBRTVIndex, bloomBDescriptor);
+    s_Data.BloomA = CreateColorTarget(width, height, BloomARTVIndex, bloomADescriptor);
+    for (uint32_t i = 0; i < BloomMipCount; ++i)
+    {
+      auto& mip = s_Data.BloomMips[i];
+      if (!mip.DescriptorIndex) mip.DescriptorIndex = AllocateDescriptor();
+      mip = CreateColorTarget(std::max(1u, width >> (i + 1)),
+        std::max(1u, height >> (i + 1)), BloomMipRTVBase + i, mip.DescriptorIndex,
+        DXGI_FORMAT_R11G11B10_FLOAT);
+    }
+    CreateGPUResources(width, height);
     s_Data.PostProcessColor = CreateColorTarget(
       width, height, PostProcessRTVIndex, postProcessDescriptor, BackBufferFormat);
     s_Data.SceneResult = CreateColorTarget(
@@ -554,10 +596,31 @@ namespace
     s_Data.Device->CreateShaderResourceView(
       s_Data.ShadowMap.Resource.Get(), &srv, GetSRVCPUHandle(descriptorIndex));
     s_Data.ShadowMapSize = size;
+    // Same stratified disk kernel and 16x16 shadow-texel pattern as GL.
+    const uint32_t filterSize = size >= 4096 ? 4u : (size >= 2048 ? 3u : 2u);
+    std::default_random_engine generator;
+    std::uniform_real_distribution<float> jitter(-0.5f, 0.5f);
+    std::vector<glm::vec2> offsets;
+    offsets.reserve(16 * 16 * filterSize * filterSize);
+    for (uint32_t tileY = 0; tileY < 16; ++tileY)
+      for (uint32_t tileX = 0; tileX < 16; ++tileX)
+        for (int v = int(filterSize) - 1; v >= 0; --v)
+          for (uint32_t u = 0; u < filterSize; ++u)
+          {
+            const float x = (float(u) + 0.5f + jitter(generator)) / filterSize;
+            const float y = (float(v) + 0.5f + jitter(generator)) / filterSize;
+            offsets.emplace_back(std::sqrt(y) * std::cos(glm::two_pi<float>() * x),
+                                 std::sqrt(y) * std::sin(glm::two_pi<float>() * x));
+          }
+    uint8_t* mapped = nullptr;
+    s_Data.ShadowOffsets = CreateUploadBuffer(offsets.size() * sizeof(glm::vec2), &mapped);
+    std::memcpy(mapped, offsets.data(), offsets.size() * sizeof(glm::vec2));
+    s_Data.ShadowOffsets->Unmap(0, nullptr);
   }
 
   void CreatePointShadowMap(uint32_t size)
   {
+    s_Data.PointShadowCache = {};
     if (s_Data.PointShadowMap.DescriptorIndex == 0)
       s_Data.PointShadowMap.DescriptorIndex = AllocateDescriptor();
     const uint32_t descriptorIndex = s_Data.PointShadowMap.DescriptorIndex;
@@ -617,7 +680,7 @@ namespace
     depthDesc.Height = size;
     depthDesc.DepthOrArraySize = 1;
     depthDesc.MipLevels = 1;
-    depthDesc.Format = DepthFormat;
+    depthDesc.Format = DXGI_FORMAT_R32_TYPELESS;
     depthDesc.SampleDesc.Count = 1;
     depthDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     depthDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
@@ -670,7 +733,6 @@ namespace
 
   void LogD3D12Messages()
   {
-#ifdef DEBUG
     if (!s_Data.InfoQueue) return;
     const uint64_t messageCount = s_Data.InfoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
     for (uint64_t i = 0; i < messageCount; ++i)
@@ -684,13 +746,15 @@ namespace
           message->Severity <= D3D12_MESSAGE_SEVERITY_WARNING)
       {
         if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR)
+        {
+          s_Data.FrameFailed = true;
           gablog_log(LOG_ERROR, __FILE__, __LINE__, "D3D12 validation: %s", message->pDescription);
+        }
         else
           gablog_log(LOG_WARN, __FILE__, __LINE__, "D3D12 validation: %s", message->pDescription);
       }
     }
     s_Data.InfoQueue->ClearStoredMessages();
-#endif
   }
 
   Shader::Bytecode CompileSlang(const char* path, const char* entryPoint, const char* target)
@@ -921,7 +985,7 @@ namespace
       textureRanges[i].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     }
 
-    std::array<D3D12_ROOT_PARAMETER, 6> parameters{};
+    std::array<D3D12_ROOT_PARAMETER, 12> parameters{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[0].Descriptor.ShaderRegister = 0;
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -932,6 +996,28 @@ namespace
       parameters[i + 1].DescriptorTable.pDescriptorRanges = &textureRanges[i];
       parameters[i + 1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
+
+    parameters[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[6].Descriptor.ShaderRegister = 5;
+    parameters[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    D3D12_DESCRIPTOR_RANGE materials{};
+    materials.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    materials.NumDescriptors = MaxDescriptors;
+    materials.RegisterSpace = 1;
+    parameters[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[7].DescriptorTable = {1, &materials};
+    parameters[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    for (uint32_t i = 8; i < 10; ++i)
+    {
+      parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+      parameters[i].Descriptor.ShaderRegister = i - 2;
+      parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    parameters[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[10].Descriptor.ShaderRegister = 1;
+    parameters[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[11].Descriptor.ShaderRegister = 8;
+    parameters[11].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     std::array<D3D12_STATIC_SAMPLER_DESC, 2> samplers{};
     samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -983,7 +1069,8 @@ namespace
     pipeline.RasterizerState = DefaultRasterizer();
     pipeline.DepthStencilState.DepthEnable = TRUE;
     pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     pipeline.DepthStencilState.StencilEnable = FALSE;
     pipeline.InputLayout = {InputLayout, static_cast<UINT>(std::size(InputLayout))};
     pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -996,6 +1083,41 @@ namespace
     CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(
                    &pipeline, IID_PPV_ARGS(&s_Data.ScenePipeline)),
                  "ID3D12Device::CreateGraphicsPipelineState (scene)");
+
+    pipeline.PS = {};
+    pipeline.NumRenderTargets = 0;
+    std::fill(std::begin(pipeline.RTVFormats), std::end(pipeline.RTVFormats), DXGI_FORMAT_UNKNOWN);
+    pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pipeline.RasterizerState.DepthBias = 1;
+    CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(
+      &pipeline, IID_PPV_ARGS(&s_Data.DepthPrepassPipeline)), "Create DX12 depth prepass");
+
+    const auto shadowVS = CompileSlang(SceneShader, "ShadowVS", "vs_5_1");
+    const auto pointPS = CompileSlang(SceneShader, "PointShadowPS", "ps_5_1");
+    pipeline.VS = {shadowVS.GetBufferPointer(), shadowVS.GetBufferSize()};
+    pipeline.RasterizerState.DepthBias = 0;
+    CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(
+      &pipeline, IID_PPV_ARGS(&s_Data.GPUShadowPipeline)), "Create DX12 GPU shadow pipeline");
+    pipeline.NumRenderTargets = 1;
+    pipeline.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+    pipeline.PS = {pointPS.GetBufferPointer(), pointPS.GetBufferSize()};
+    CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(
+      &pipeline, IID_PPV_ARGS(&s_Data.GPUPointShadowPipeline)), "Create DX12 GPU point shadow pipeline");
+
+    std::array<D3D12_INDIRECT_ARGUMENT_DESC, 4> arguments{};
+    arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+    arguments[0].ConstantBufferView.RootParameterIndex = 0;
+    arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW;
+    arguments[1].VertexBuffer.Slot = 0;
+    arguments[2].Type = D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW;
+    arguments[3].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+    D3D12_COMMAND_SIGNATURE_DESC signature{};
+    signature.ByteStride = sizeof(IndirectDraw);
+    signature.NumArgumentDescs = static_cast<UINT>(arguments.size());
+    signature.pArgumentDescs = arguments.data();
+    CheckHRESULT(s_Data.Device->CreateCommandSignature(&signature,
+      s_Data.SceneRootSignature.Get(), IID_PPV_ARGS(&s_Data.DrawSignature)), "Create DX12 draw signature");
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingPipeline{};
     lightingPipeline.pRootSignature = s_Data.SceneRootSignature.Get();
@@ -1014,83 +1136,6 @@ namespace
     CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(
                    &lightingPipeline, IID_PPV_ARGS(&s_Data.LightingPipeline)),
                  "ID3D12Device::CreateGraphicsPipelineState (lighting)");
-  }
-
-  void CreateShadowPipeline()
-  {
-    static constexpr const char* shaderSource = "../res/shaders/shadow.slang";
-    const auto vertexShader = CompileSlang(shaderSource, "VSMain", "vs_5_1");
-    D3D12_ROOT_PARAMETER parameter{};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    parameter.Descriptor.ShaderRegister = 0;
-    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-    rootDesc.NumParameters = 1;
-    rootDesc.pParameters = &parameter;
-    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    s_Data.ShadowRootSignature = CreateRootSignature(rootDesc);
-    static constexpr D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
-      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, Position), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-      {"BONEIDS", 0, DXGI_FORMAT_R32G32B32A32_SINT, 0, offsetof(Vertex, m_BoneIDs), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-      {"BONEWEIGHTS", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, m_Weights), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}
-    };
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline{};
-    pipeline.pRootSignature = s_Data.ShadowRootSignature.Get();
-    pipeline.VS = {vertexShader.GetBufferPointer(), vertexShader.GetBufferSize()};
-    pipeline.BlendState = DefaultBlendState();
-    pipeline.SampleMask = std::numeric_limits<UINT>::max();
-    pipeline.RasterizerState = DefaultRasterizer();
-    pipeline.RasterizerState.DepthBias = 1200;
-    pipeline.RasterizerState.SlopeScaledDepthBias = 1.5f;
-    pipeline.DepthStencilState.DepthEnable = TRUE;
-    pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    pipeline.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
-    pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pipeline.DSVFormat = DepthFormat;
-    pipeline.SampleDesc.Count = 1;
-    CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&s_Data.ShadowPipeline)),
-                 "Create DX12 shadow pipeline");
-  }
-
-  void CreatePointShadowPipeline()
-  {
-    static constexpr const char* shaderSource = "../res/shaders/point_shadow.slang";
-    const auto vertexShader = CompileSlang(shaderSource, "VSMain", "vs_5_1");
-    const auto pixelShader = CompileSlang(shaderSource, "PSMain", "ps_5_1");
-    D3D12_ROOT_PARAMETER parameter{};
-    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    parameter.Descriptor.ShaderRegister = 0;
-    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-    rootDesc.NumParameters = 1;
-    rootDesc.pParameters = &parameter;
-    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-    s_Data.PointShadowRootSignature = CreateRootSignature(rootDesc);
-    static constexpr D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
-      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(Vertex, Position), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-      {"BONEIDS", 0, DXGI_FORMAT_R32G32B32A32_SINT, 0, offsetof(Vertex, m_BoneIDs), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-      {"BONEWEIGHTS", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, m_Weights), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}
-    };
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline{};
-    pipeline.pRootSignature = s_Data.PointShadowRootSignature.Get();
-    pipeline.VS = {vertexShader.GetBufferPointer(), vertexShader.GetBufferSize()};
-    pipeline.PS = {pixelShader.GetBufferPointer(), pixelShader.GetBufferSize()};
-    pipeline.BlendState = DefaultBlendState();
-    pipeline.SampleMask = std::numeric_limits<UINT>::max();
-    pipeline.RasterizerState = DefaultRasterizer();
-    pipeline.DepthStencilState.DepthEnable = TRUE;
-    pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    pipeline.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
-    pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pipeline.NumRenderTargets = 1;
-    pipeline.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
-    pipeline.DSVFormat = DepthFormat;
-    pipeline.SampleDesc.Count = 1;
-    CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(
-                   &pipeline, IID_PPV_ARGS(&s_Data.PointShadowPipeline)),
-                 "Create DX12 point shadow pipeline");
   }
 
   void CreateSkyboxPipeline()
@@ -1248,13 +1293,13 @@ namespace
   void CreatePostProcessPipelines()
   {
     static constexpr const char* shaderSource = "../res/shaders/postprocess.slang";
-    const auto vs=CompileSlang(shaderSource,"VSMain","vs_5_1"); const auto extract=CompileSlang(shaderSource,"Extract","ps_5_1"); const auto blur=CompileSlang(shaderSource,"Blur","ps_5_1"); const auto composite=CompileSlang(shaderSource,"Composite","ps_5_1"); const auto postProcess=CompileSlang(shaderSource,"PostProcess","ps_5_1");
+    const auto vs=CompileSlang(shaderSource,"VSMain","vs_5_1"); const auto extract=CompileSlang(shaderSource,"Extract","ps_5_1"); const auto down=CompileSlang("../res/shaders/bloom_downsample.slang","PSMain","ps_5_1"); const auto up=CompileSlang("../res/shaders/bloom_upsample.slang","PSMain","ps_5_1"); const auto composite=CompileSlang(shaderSource,"Composite","ps_5_1"); const auto postProcess=CompileSlang(shaderSource,"PostProcess","ps_5_1");
     std::array<D3D12_DESCRIPTOR_RANGE,2> ranges{}; for(uint32_t i=0;i<2;++i){ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;ranges[i].NumDescriptors=1;ranges[i].BaseShaderRegister=i;}
     std::array<D3D12_ROOT_PARAMETER,3> parameters{}; parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; parameters[0].Constants.ShaderRegister=0; parameters[0].Constants.Num32BitValues=8; for(uint32_t i=0;i<2;++i){parameters[i+1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;parameters[i+1].DescriptorTable={1,&ranges[i]};parameters[i+1].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;}
     D3D12_STATIC_SAMPLER_DESC sampler{}; sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR; sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP; sampler.MaxLOD=D3D12_FLOAT32_MAX; sampler.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rootDesc{}; rootDesc.NumParameters=static_cast<UINT>(parameters.size()); rootDesc.pParameters=parameters.data(); rootDesc.NumStaticSamplers=1; rootDesc.pStaticSamplers=&sampler; s_Data.PostRootSignature=CreateRootSignature(rootDesc);
-    auto createPipeline=[&](const Shader::Bytecode& pixelShader,DXGI_FORMAT format,ComPtr<ID3D12PipelineState>& result,const char* name){D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};p.pRootSignature=s_Data.PostRootSignature.Get();p.VS={vs.GetBufferPointer(),vs.GetBufferSize()};p.PS={pixelShader.GetBufferPointer(),pixelShader.GetBufferSize()};p.BlendState=DefaultBlendState();p.SampleMask=std::numeric_limits<UINT>::max();p.RasterizerState=DefaultRasterizer();p.DepthStencilState.DepthEnable=FALSE;p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;p.NumRenderTargets=1;p.RTVFormats[0]=format;p.SampleDesc.Count=1;CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&result)),name);};
-    createPipeline(extract,SceneColorFormat,s_Data.BloomExtractPipeline,"Create DX12 bloom extract pipeline"); createPipeline(blur,SceneColorFormat,s_Data.BloomBlurPipeline,"Create DX12 bloom blur pipeline"); createPipeline(composite,SceneColorFormat,s_Data.CompositePipeline,"Create DX12 composite pipeline"); createPipeline(postProcess,BackBufferFormat,s_Data.PostProcessPipeline,"Create DX12 post-process pipeline");
+    auto createPipeline=[&](const Shader::Bytecode& pixelShader,DXGI_FORMAT format,ComPtr<ID3D12PipelineState>& result,const char* name, bool additive=false){D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};p.pRootSignature=s_Data.PostRootSignature.Get();p.VS={vs.GetBufferPointer(),vs.GetBufferSize()};p.PS={pixelShader.GetBufferPointer(),pixelShader.GetBufferSize()};p.BlendState=DefaultBlendState();if(additive){auto& b=p.BlendState.RenderTarget[0];b.BlendEnable=TRUE;b.BlendOp=b.BlendOpAlpha=D3D12_BLEND_OP_ADD;b.SrcBlend=b.DestBlend=b.SrcBlendAlpha=b.DestBlendAlpha=D3D12_BLEND_ONE;}p.SampleMask=std::numeric_limits<UINT>::max();p.RasterizerState=DefaultRasterizer();p.DepthStencilState.DepthEnable=FALSE;p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;p.NumRenderTargets=1;p.RTVFormats[0]=format;p.SampleDesc.Count=1;CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&result)),name);};
+    createPipeline(extract,SceneColorFormat,s_Data.BloomExtractPipeline,"Create DX12 bloom extract pipeline"); createPipeline(down,DXGI_FORMAT_R11G11B10_FLOAT,s_Data.BloomDownsamplePipeline,"Create DX12 bloom downsample"); createPipeline(up,DXGI_FORMAT_R11G11B10_FLOAT,s_Data.BloomUpsamplePipeline,"Create DX12 bloom upsample",true); createPipeline(composite,SceneColorFormat,s_Data.CompositePipeline,"Create DX12 composite pipeline"); createPipeline(postProcess,BackBufferFormat,s_Data.PostProcessPipeline,"Create DX12 post-process pipeline");
   }
 
   void CreateUIPipeline()
@@ -1634,6 +1679,12 @@ namespace
       std::min(lights.size(), static_cast<size_t>(MaxSceneLights)));
     constants.LightCount.x = lightCount;
     constants.LightCount.y = effects.ShadowQuality == GraphicsQuality::Off ? 0u : 1u;
+    constants.LightCount.z = s_Data.TileCountX;
+    constants.LightCount.w = RenderBackend::DebugSettings().TiledLightingMode;
+    const uint32_t filterSize = effects.ShadowQuality == GraphicsQuality::High ? 4u :
+      (effects.ShadowQuality == GraphicsQuality::Medium ? 3u : 2u);
+    constants.ShadowFilter = glm::vec4(float(filterSize * filterSize),
+      0.5f + 0.5f * filterSize, 0, 0);
     constants.Resolution = glm::vec4(
       static_cast<float>(s_Data.Width), static_cast<float>(s_Data.Height),
       effects.PS1VirtualHeight, effects.PS1Enabled ? 1.0f : 0.0f);
@@ -1654,112 +1705,7 @@ namespace
     return constants;
   }
 
-  void DrawModels(const RenderEffectSettings& effects)
-  {
-    RenderStatistics statistics;
-    if (s_Data.Meshes.empty())
-    {
-      RenderBackend::SetStatistics(statistics);
-      return;
-    }
-
-    ID3D12DescriptorHeap* descriptorHeaps[] = {s_Data.SRVHeap.Get()};
-    s_Data.CommandList->SetDescriptorHeaps(1, descriptorHeaps);
-    s_Data.CommandList->SetPipelineState(s_Data.ScenePipeline.Get());
-    s_Data.CommandList->SetGraphicsRootSignature(s_Data.SceneRootSignature.Get());
-    s_Data.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    SceneConstants constants = BuildSceneConstants(effects);
-
-    const RenderFrustum frustum(Camera::GetViewProjection());
-    for (const std::string& modelName : ModelManager::GetModelNames())
-    {
-      const std::shared_ptr<Model> model = ModelManager::GetModel(modelName);
-      if (!model || !model->m_IsRendered || model->GetPhysXMeshType() == MeshType::CONVEXMESH)
-        continue;
-
-      const bool animated = model->IsAnimated();
-      constants.CameraPosition.w = animated ? 1.0f : 0.0f;
-      constants.Bones.fill(glm::mat4(1.0f));
-      if (animated)
-      {
-        const auto& bones = model->GetFinalBoneMatrices();
-        const size_t count = std::min(bones.size(), constants.Bones.size());
-        std::copy_n(bones.begin(), count, constants.Bones.begin());
-      }
-
-      const auto& instances = model->m_InstanceTransforms;
-      if (instances.empty()) continue;
-      statistics.RenderableInstances += static_cast<uint32_t>(instances.size());
-      for (const glm::mat4& transform : instances)
-      {
-        const WorldBoundingSphere sphere = CalculateWorldBoundingSphere(*model, transform);
-        if (!frustum.IntersectsSphere(sphere.center, sphere.radius)) continue;
-        ++statistics.VisibleInstances;
-        constants.Model = transform;
-        for (const Mesh& mesh : model->GetMeshes())
-        {
-          const auto gpuIt = s_Data.Meshes.find(&mesh);
-          if (gpuIt == s_Data.Meshes.end()) continue;
-          const GPUMesh& gpuMesh = gpuIt->second;
-          constants.MaterialFlags = glm::vec4(
-            gpuMesh.HasNormalMap ? 1.0f : 0.0f,
-            gpuMesh.HasSpecularMap ? 1.0f : 0.0f, 0.0f, 0.0f);
-          s_Data.CommandList->SetGraphicsRootConstantBufferView(0, UploadSceneConstants(constants));
-          s_Data.CommandList->SetGraphicsRootDescriptorTable(1, GetSRVGPUHandle(gpuMesh.DiffuseDescriptorIndex));
-          s_Data.CommandList->SetGraphicsRootDescriptorTable(2, GetSRVGPUHandle(gpuMesh.NormalDescriptorIndex));
-          s_Data.CommandList->SetGraphicsRootDescriptorTable(3, GetSRVGPUHandle(gpuMesh.SpecularDescriptorIndex));
-          s_Data.CommandList->SetGraphicsRootDescriptorTable(4, GetSRVGPUHandle(s_Data.ShadowMap.DescriptorIndex));
-          s_Data.CommandList->SetGraphicsRootDescriptorTable(5, GetSRVGPUHandle(s_Data.PointShadowMap.DescriptorIndex));
-          s_Data.CommandList->IASetVertexBuffers(0, 1, &gpuMesh.VertexView);
-          s_Data.CommandList->IASetIndexBuffer(&gpuMesh.IndexView);
-          s_Data.CommandList->DrawIndexedInstanced(gpuMesh.IndexCount, 1, 0, 0, 0);
-        }
-      }
-    }
-
-    for (const RenderModelPreview& preview : s_Data.ModelPreviews)
-    {
-      const auto model = ModelManager::GetModel(preview.ModelName);
-      if (!model || model->GetPhysXMeshType() == MeshType::CONVEXMESH) continue;
-
-      const bool animated = model->IsAnimated();
-      constants.CameraPosition.w = animated ? 1.0f : 0.0f;
-      constants.Bones.fill(glm::mat4(1.0f));
-      if (animated)
-      {
-        const auto& bones = model->GetFinalBoneMatrices();
-        std::copy_n(bones.begin(), std::min(bones.size(), constants.Bones.size()),
-          constants.Bones.begin());
-      }
-
-      constants.Model = preview.Transform;
-      for (const Mesh& mesh : model->GetMeshes())
-      {
-        const auto gpuIt = s_Data.Meshes.find(&mesh);
-        if (gpuIt == s_Data.Meshes.end()) continue;
-        const GPUMesh& gpuMesh = gpuIt->second;
-        constants.MaterialFlags = glm::vec4(
-          gpuMesh.HasNormalMap ? 1.0f : 0.0f,
-          gpuMesh.HasSpecularMap ? 1.0f : 0.0f, preview.Brightness, 0.0f);
-        s_Data.CommandList->SetGraphicsRootConstantBufferView(0, UploadSceneConstants(constants));
-        s_Data.CommandList->SetGraphicsRootDescriptorTable(
-          1, GetSRVGPUHandle(gpuMesh.DiffuseDescriptorIndex));
-        s_Data.CommandList->SetGraphicsRootDescriptorTable(
-          2, GetSRVGPUHandle(gpuMesh.NormalDescriptorIndex));
-        s_Data.CommandList->SetGraphicsRootDescriptorTable(
-          3, GetSRVGPUHandle(gpuMesh.SpecularDescriptorIndex));
-        s_Data.CommandList->SetGraphicsRootDescriptorTable(
-          4, GetSRVGPUHandle(s_Data.ShadowMap.DescriptorIndex));
-        s_Data.CommandList->SetGraphicsRootDescriptorTable(
-          5, GetSRVGPUHandle(s_Data.PointShadowMap.DescriptorIndex));
-        s_Data.CommandList->IASetVertexBuffers(0, 1, &gpuMesh.VertexView);
-        s_Data.CommandList->IASetIndexBuffer(&gpuMesh.IndexView);
-        s_Data.CommandList->DrawIndexedInstanced(gpuMesh.IndexCount, 1, 0, 0, 0);
-      }
-    }
-    RenderBackend::SetStatistics(statistics);
-  }
+  #include "DirectX12Pipeline.inl"
 
   glm::mat4 CalculateLightViewProjection()
   {
@@ -1809,39 +1755,10 @@ namespace
 
     if (effects.ShadowQuality != GraphicsQuality::Off)
     {
-      s_Data.CommandList->SetPipelineState(s_Data.ShadowPipeline.Get());
-      s_Data.CommandList->SetGraphicsRootSignature(s_Data.ShadowRootSignature.Get());
-      s_Data.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-      ShadowConstants constants;
-      constants.LightViewProjection = s_Data.LightViewProjection;
-      constants.Bones.fill(glm::mat4(1.0f));
-      for (const std::string& modelName : ModelManager::GetModelNames())
-      {
-        const auto model = ModelManager::GetModel(modelName);
-        if (!model || !model->m_IsRendered || model->GetPhysXMeshType() == MeshType::CONVEXMESH) continue;
-        const bool animated = model->IsAnimated();
-        constants.Animated.x = animated ? 1.0f : 0.0f;
-        constants.Bones.fill(glm::mat4(1.0f));
-        if (animated)
-        {
-          const auto& bones = model->GetFinalBoneMatrices();
-          std::copy_n(bones.begin(), std::min(bones.size(), constants.Bones.size()), constants.Bones.begin());
-        }
-        for (const glm::mat4& transform : model->m_InstanceTransforms)
-        {
-          constants.Model = transform;
-          for (const Mesh& mesh : model->GetMeshes())
-          {
-            const auto found = s_Data.Meshes.find(&mesh);
-            if (found == s_Data.Meshes.end()) continue;
-            const GPUMesh& gpu = found->second;
-            s_Data.CommandList->SetGraphicsRootConstantBufferView(0, UploadConstants(constants));
-            s_Data.CommandList->IASetVertexBuffers(0, 1, &gpu.VertexView);
-            s_Data.CommandList->IASetIndexBuffer(&gpu.IndexView);
-            s_Data.CommandList->DrawIndexedInstanced(gpu.IndexCount, 1, 0, 0, 0);
-          }
-        }
-      }
+      DispatchGPUCull(false, s_Data.LightViewProjection, effects, true);
+      struct ShadowFrame { glm::mat4 ViewProjection; glm::vec4 LightPosition; };
+      DrawGPUScene(s_Data.GPUShadowPipeline.Get(),
+        UploadConstants(ShadowFrame{s_Data.LightViewProjection, glm::vec4(0)}));
     }
     TransitionResource(s_Data.ShadowMap.Resource.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1864,11 +1781,9 @@ namespace
     candidates.reserve(lights.size());
     const glm::vec3 cameraPosition = Camera::GetPosition();
     const RenderFrustum cameraFrustum(Camera::GetViewProjection());
-    uint32_t supportedPointLights = 0;
-    for (uint32_t i = 0; i < static_cast<uint32_t>(lights.size()); ++i)
+    for (uint32_t i = 0; i < std::min(uint32_t(lights.size()), MaxSceneLights); ++i)
     {
       if (lights[i].Type != LightType::POINT) continue;
-      if (supportedPointLights++ >= 20u) break;
       if (!cameraFrustum.IntersectsSphere(lights[i].Position, PointShadowRadius)) continue;
       const glm::vec3 delta = lights[i].Position - cameraPosition;
       candidates.push_back({glm::dot(delta, delta), i});
@@ -1876,30 +1791,32 @@ namespace
     std::ranges::sort(candidates, {}, &Candidate::DistanceSquared);
     const uint32_t shadowCount = static_cast<uint32_t>(std::min(
       candidates.size(), static_cast<size_t>(MaxShadowedPointLights)));
+    if (shadowCount == 0) return;
+    s_Data.PointShadowLightIndices.assign(MaxShadowedPointLights, UINT32_MAX);
+    std::array<bool, MaxShadowedPointLights> assigned{};
     for (uint32_t i = 0; i < shadowCount; ++i)
-      s_Data.PointShadowLightIndices.push_back(candidates[i].LightIndex);
-    if (s_Data.PointShadowLightIndices.empty()) return;
+      for (uint32_t slot = 0; slot < MaxShadowedPointLights; ++slot)
+        if (!assigned[slot] && s_Data.PointShadowCache[slot].Valid &&
+            s_Data.PointShadowCache[slot].LightIndex == candidates[i].LightIndex)
+        {
+          s_Data.PointShadowLightIndices[slot] = candidates[i].LightIndex;
+          assigned[slot] = true;
+          break;
+        }
+    for (uint32_t i = 0; i < shadowCount; ++i)
+    {
+      if (std::ranges::find(s_Data.PointShadowLightIndices, candidates[i].LightIndex) != s_Data.PointShadowLightIndices.end()) continue;
+      const auto freeSlot = std::ranges::find(assigned, false);
+      const auto slot = static_cast<size_t>(freeSlot - assigned.begin());
+      assigned[slot] = true;
+      s_Data.PointShadowLightIndices[slot] = candidates[i].LightIndex;
+    }
 
     if (s_Data.PointShadowMapReadable)
       TransitionResource(s_Data.PointShadowMap.Resource.Get(),
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     s_Data.PointShadowMapReadable = false;
 
-    static constexpr std::array<glm::vec3, PointShadowFaceCount> directions = {
-      glm::vec3(1, 0, 0), glm::vec3(-1, 0, 0),
-      glm::vec3(0, 1, 0), glm::vec3(0, -1, 0),
-      glm::vec3(0, 0, 1), glm::vec3(0, 0, -1)
-    };
-    static constexpr std::array<glm::vec3, PointShadowFaceCount> upDirections = {
-      glm::vec3(0, 1, 0), glm::vec3(0, 1, 0),
-      glm::vec3(0, 0, -1), glm::vec3(0, 0, 1),
-      glm::vec3(0, 1, 0), glm::vec3(0, 1, 0)
-    };
-    glm::mat4 correction(1.0f);
-    correction[2][2] = 0.5f;
-    correction[3][2] = 0.5f;
-    const glm::mat4 projection = correction * glm::perspective(
-      glm::radians(90.0f), 1.0f, 0.1f, PointShadowRadius);
     const D3D12_VIEWPORT viewport{0.0f, 0.0f,
       static_cast<float>(s_Data.PointShadowMapSize),
       static_cast<float>(s_Data.PointShadowMapSize), 0.0f, 1.0f};
@@ -1908,17 +1825,18 @@ namespace
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = GetDSVHandle(2);
     s_Data.CommandList->RSSetViewports(1, &viewport);
     s_Data.CommandList->RSSetScissorRects(1, &scissor);
-    s_Data.CommandList->SetPipelineState(s_Data.PointShadowPipeline.Get());
-    s_Data.CommandList->SetGraphicsRootSignature(s_Data.PointShadowRootSignature.Get());
-    s_Data.CommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
     static constexpr float clearDistance[] = {
       PointShadowRadius, PointShadowRadius, PointShadowRadius, PointShadowRadius};
-    PointShadowConstants constants;
-    constants.Bones.fill(glm::mat4(1.0f));
-    for (uint32_t slot = 0; slot < shadowCount; ++slot)
+    for (uint32_t slot = 0; slot < MaxShadowedPointLights; ++slot)
     {
-      const glm::vec3 lightPosition = lights[s_Data.PointShadowLightIndices[slot]].Position;
+      const uint32_t lightIndex = s_Data.PointShadowLightIndices[slot];
+      if (lightIndex == UINT32_MAX) continue;
+      const glm::vec3 lightPosition = lights[lightIndex].Position;
+      const auto casterState = GetPointShadowCasterState(lightPosition);
+      auto& cache = s_Data.PointShadowCache[slot];
+      if (cache.Valid && cache.LightIndex == lightIndex &&
+          cache.LightPosition == lightPosition && cache.CasterHash == casterState.Hash &&
+          !casterState.Animated) continue;
       for (uint32_t face = 0; face < PointShadowFaceCount; ++face)
       {
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv = GetRTVHandle(
@@ -1927,44 +1845,14 @@ namespace
         s_Data.CommandList->ClearDepthStencilView(
           dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
         s_Data.CommandList->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-        constants.LightViewProjection = projection * glm::lookAt(
-          lightPosition, lightPosition + directions[face], upDirections[face]);
-
-        for (const std::string& modelName : ModelManager::GetModelNames())
-        {
-          const auto model = ModelManager::GetModel(modelName);
-          if (!model || !model->m_IsRendered || model->GetPhysXMeshType() == MeshType::CONVEXMESH)
-            continue;
-          const bool animated = model->IsAnimated();
-          constants.LightPositionAndAnimated = glm::vec4(
-            lightPosition, animated ? 1.0f : 0.0f);
-          constants.Bones.fill(glm::mat4(1.0f));
-          if (animated)
-          {
-            const auto& bones = model->GetFinalBoneMatrices();
-            std::copy_n(bones.begin(), std::min(bones.size(), constants.Bones.size()),
-              constants.Bones.begin());
-          }
-          for (const glm::mat4& transform : model->m_InstanceTransforms)
-          {
-            const WorldBoundingSphere sphere = CalculateWorldBoundingSphere(*model, transform);
-            if (glm::distance(sphere.center, lightPosition) > PointShadowRadius + sphere.radius)
-              continue;
-            constants.Model = transform;
-            const D3D12_GPU_VIRTUAL_ADDRESS constantsAddress = UploadConstants(constants);
-            for (const Mesh& mesh : model->GetMeshes())
-            {
-              const auto found = s_Data.Meshes.find(&mesh);
-              if (found == s_Data.Meshes.end()) continue;
-              const GPUMesh& gpu = found->second;
-              s_Data.CommandList->SetGraphicsRootConstantBufferView(0, constantsAddress);
-              s_Data.CommandList->IASetVertexBuffers(0, 1, &gpu.VertexView);
-              s_Data.CommandList->IASetIndexBuffer(&gpu.IndexView);
-              s_Data.CommandList->DrawIndexedInstanced(gpu.IndexCount, 1, 0, 0, 0);
-            }
-          }
-        }
+        const glm::mat4 lightViewProjection = DX12Shadow::PointViewProjection(
+          lightPosition, face, 0.1f, PointShadowRadius);
+        DispatchGPUCull(false, lightViewProjection, effects, true);
+        struct ShadowFrame { glm::mat4 ViewProjection; glm::vec4 LightPosition; };
+        DrawGPUScene(s_Data.GPUPointShadowPipeline.Get(),
+          UploadConstants(ShadowFrame{lightViewProjection, glm::vec4(lightPosition, 0)}));
       }
+      cache = {casterState.Hash, lightPosition, lightIndex, true};
     }
 
     TransitionResource(s_Data.PointShadowMap.Resource.Get(),
@@ -1989,7 +1877,6 @@ namespace
     static constexpr float clear[] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (const auto& renderTarget : renderTargets)
       s_Data.CommandList->ClearRenderTargetView(renderTarget, clear, 0, nullptr);
-    s_Data.CommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     s_Data.CommandList->OMSetRenderTargets(
       static_cast<UINT>(renderTargets.size()), renderTargets.data(), FALSE, &dsv);
     s_Data.CommandList->RSSetViewports(1, &s_Data.Viewport);
@@ -2022,6 +1909,9 @@ namespace
     s_Data.CommandList->SetGraphicsRootSignature(s_Data.SceneRootSignature.Get());
     const SceneConstants constants = BuildSceneConstants(effects);
     s_Data.CommandList->SetGraphicsRootConstantBufferView(0, UploadSceneConstants(constants));
+    s_Data.CommandList->SetGraphicsRootShaderResourceView(8, s_Data.TileGrid->GetGPUVirtualAddress());
+    s_Data.CommandList->SetGraphicsRootShaderResourceView(9, s_Data.TileIndices->GetGPUVirtualAddress());
+    s_Data.CommandList->SetGraphicsRootShaderResourceView(11, s_Data.ShadowOffsets->GetGPUVirtualAddress());
     s_Data.CommandList->SetGraphicsRootDescriptorTable(
       1, GetSRVGPUHandle(s_Data.GPosition.DescriptorIndex));
     s_Data.CommandList->SetGraphicsRootDescriptorTable(
@@ -2081,48 +1971,50 @@ namespace
     TransitionResource(s_Data.SceneColor.Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     const bool bloomEnabled = effects.BloomQuality != GraphicsQuality::Off;
-    const uint32_t bloomWidth = std::max(1u, s_Data.Width / 2u);
-    const uint32_t bloomHeight = std::max(1u, s_Data.Height / 2u);
-    const D3D12_VIEWPORT bloomViewport{0.0f, 0.0f, static_cast<float>(bloomWidth), static_cast<float>(bloomHeight), 0.0f, 1.0f};
-    const D3D12_RECT bloomScissor{0, 0, static_cast<LONG>(bloomWidth), static_cast<LONG>(bloomHeight)};
-
     if (bloomEnabled)
     {
+      // Extract at full resolution before filtering, as the GL lighting MRT does.
       TransitionResource(s_Data.BloomA.Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                          D3D12_RESOURCE_STATE_RENDER_TARGET);
       auto rtv = GetRTVHandle(BloomARTVIndex);
-      static constexpr float clear[] = {0, 0, 0, 0};
-      s_Data.CommandList->ClearRenderTargetView(rtv, clear, 0, nullptr);
       s_Data.CommandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-      s_Data.CommandList->RSSetViewports(1, &bloomViewport);
-      s_Data.CommandList->RSSetScissorRects(1, &bloomScissor);
+      s_Data.CommandList->RSSetViewports(1, &s_Data.Viewport);
+      s_Data.CommandList->RSSetScissorRects(1, &s_Data.ScissorRect);
       DrawFullscreenPass(s_Data.BloomExtractPipeline.Get(), s_Data.SceneColor.DescriptorIndex,
-                         s_Data.WhiteTexture.DescriptorIndex, glm::vec4(0.0f),
-                         glm::vec4(effects.BloomThreshold, 0.0f, 0.0f, 0.0f));
+        s_Data.WhiteTexture.DescriptorIndex, glm::vec4(0.0f), glm::vec4(effects.BloomThreshold, 0, 0, 0));
       TransitionResource(s_Data.BloomA.Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-      const uint32_t iterations = effects.BloomPassCount();
-      for (uint32_t i = 0; i < iterations; ++i)
+      const uint32_t mipCount = std::clamp(effects.BloomPassCount(), 1u, BloomMipCount);
+      auto bindMip = [&](uint32_t mip)
       {
-        TransitionResource(s_Data.BloomB.Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                           D3D12_RESOURCE_STATE_RENDER_TARGET);
-        rtv = GetRTVHandle(BloomBRTVIndex);
+        const uint32_t width = std::max(1u, s_Data.Width >> (mip + 1));
+        const uint32_t height = std::max(1u, s_Data.Height >> (mip + 1));
+        const D3D12_VIEWPORT viewport{0, 0, float(width), float(height), 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(width), LONG(height)};
+        rtv = GetRTVHandle(BloomMipRTVBase + mip);
         s_Data.CommandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        DrawFullscreenPass(s_Data.BloomBlurPipeline.Get(), s_Data.BloomA.DescriptorIndex,
-                           s_Data.WhiteTexture.DescriptorIndex,
-                           glm::vec4(1.0f / bloomWidth, 0.0f, 0.0f, 0.0f));
-        TransitionResource(s_Data.BloomB.Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        TransitionResource(s_Data.BloomA.Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                           D3D12_RESOURCE_STATE_RENDER_TARGET);
-        rtv = GetRTVHandle(BloomARTVIndex);
-        s_Data.CommandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        DrawFullscreenPass(s_Data.BloomBlurPipeline.Get(), s_Data.BloomB.DescriptorIndex,
-                           s_Data.WhiteTexture.DescriptorIndex,
-                           glm::vec4(0.0f, 1.0f / bloomHeight, 0.0f, 0.0f));
-        TransitionResource(s_Data.BloomA.Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        s_Data.CommandList->RSSetViewports(1, &viewport);
+        s_Data.CommandList->RSSetScissorRects(1, &scissor);
+      };
+      for (uint32_t i = 0; i < mipCount; ++i)
+      {
+        auto& mip = s_Data.BloomMips[i];
+        TransitionResource(mip.Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        bindMip(i);
+        DrawFullscreenPass(s_Data.BloomDownsamplePipeline.Get(),
+          i == 0 ? s_Data.BloomA.DescriptorIndex : s_Data.BloomMips[i - 1].DescriptorIndex,
+          s_Data.WhiteTexture.DescriptorIndex,
+          glm::vec4(float(std::max(1u, s_Data.Width >> i)), float(std::max(1u, s_Data.Height >> i)), float(i), 0));
+        TransitionResource(mip.Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      }
+      for (uint32_t i = mipCount - 1; i > 0; --i)
+      {
+        auto& target = s_Data.BloomMips[i - 1];
+        TransitionResource(target.Resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        bindMip(i - 1);
+        DrawFullscreenPass(s_Data.BloomUpsamplePipeline.Get(), s_Data.BloomMips[i].DescriptorIndex,
+          s_Data.WhiteTexture.DescriptorIndex, glm::vec4(effects.BloomFilterRadius, 0, 0, 0));
+        TransitionResource(target.Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
       }
     }
 
@@ -2134,7 +2026,7 @@ namespace
     s_Data.CommandList->RSSetViewports(1, &s_Data.Viewport);
     s_Data.CommandList->RSSetScissorRects(1, &s_Data.ScissorRect);
     DrawFullscreenPass(s_Data.CompositePipeline.Get(), s_Data.SceneColor.DescriptorIndex,
-                       s_Data.BloomA.DescriptorIndex,
+                       bloomEnabled ? s_Data.BloomMips[0].DescriptorIndex : s_Data.WhiteTexture.DescriptorIndex,
                        glm::vec4(bloomEnabled ? effects.BloomStrength : 0.0f),
                        glm::vec4(effects.BloomExposure, 0.0f, 0.0f, effects.Gamma));
 
@@ -2211,6 +2103,8 @@ namespace
 
   void RetireSceneResources()
   {
+    s_Data.PointShadowCache = {};
+    for (auto& frame : s_Data.GPUFrames) frame.StatisticsReady = false;
     for (auto& [key, mesh] : s_Data.Meshes)
     {
       if (mesh.VertexBuffer) s_Data.RetiredResources.push_back(std::move(mesh.VertexBuffer));
@@ -2240,16 +2134,22 @@ bool DirectX12Renderer::Init(void* nativeWindow, uint32_t width, uint32_t height
   try
   {
     UINT factoryFlags = 0;
+    bool validation = GetEnvironmentVariableA("GABGL_DX12_VALIDATION", nullptr, 0) != 0;
 #ifdef DEBUG
-    ComPtr<ID3D12Debug> debugController;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
-    {
-      debugController->EnableDebugLayer();
-      factoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
-    }
-    else
-      gablog_log(LOG_WARN, __FILE__, __LINE__, "DirectX 12 debug layer is not available");
+    validation = true;
 #endif
+    if (validation)
+    {
+      ComPtr<ID3D12Debug> debugController;
+      if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController))))
+      {
+        debugController->EnableDebugLayer();
+        factoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
+        gablog_log(LOG_INFO, __FILE__, __LINE__, "DirectX 12 validation enabled");
+      }
+      else
+        gablog_log(LOG_WARN, __FILE__, __LINE__, "DirectX 12 debug layer is not available");
+    }
 
     CheckHRESULT(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&s_Data.Factory)),
                  "CreateDXGIFactory2");
@@ -2291,9 +2191,7 @@ bool DirectX12Renderer::Init(void* nativeWindow, uint32_t width, uint32_t height
       gablog_log(LOG_WARN, __FILE__, __LINE__, "No hardware DX12 adapter found; using WARP software renderer");
     }
 
-#ifdef DEBUG
-    s_Data.Device.As(&s_Data.InfoQueue);
-#endif
+    if (validation) s_Data.Device.As(&s_Data.InfoQueue);
 
     DXGI_ADAPTER_DESC1 selectedAdapter{};
     s_Data.Adapter->GetDesc1(&selectedAdapter);
@@ -2327,8 +2225,7 @@ bool DirectX12Renderer::Init(void* nativeWindow, uint32_t width, uint32_t height
     s_Data.FrameIndex = s_Data.SwapChain->GetCurrentBackBufferIndex();
 
     D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
-    rtvDesc.NumDescriptors = PointShadowRTVBaseIndex
-      + MaxShadowedPointLights * PointShadowFaceCount;
+    rtvDesc.NumDescriptors = BloomMipRTVBase + BloomMipCount;
     rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     CheckHRESULT(s_Data.Device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&s_Data.RTVHeap)),
                  "ID3D12Device::CreateDescriptorHeap (RTV)");
@@ -2407,8 +2304,7 @@ bool DirectX12Renderer::InitSceneRenderer()
     }
 
     CreateScenePipeline();
-    CreateShadowPipeline();
-    CreatePointShadowPipeline();
+    CreateComputePipelines();
     CreateSkyboxPipeline();
     CreateParticlePipeline();
     CreateDebugLinePipeline();
@@ -2456,7 +2352,24 @@ void DirectX12Renderer::ShutdownSceneRenderer()
   s_Data.GNormal = {};
   s_Data.GAlbedoSpec = {};
   s_Data.BloomA = {};
-  s_Data.BloomB = {};
+  s_Data.BloomMips = {};
+  s_Data.HiZ = {};
+  s_Data.GPUFrames = {};
+  s_Data.TileGrid.Reset();
+  s_Data.TileIndices.Reset();
+  s_Data.ShadowOffsets.Reset();
+  s_Data.CullRootSignature.Reset();
+  s_Data.HiZRootSignature.Reset();
+  s_Data.TileRootSignature.Reset();
+  s_Data.CullPipeline.Reset();
+  s_Data.HiZPipeline.Reset();
+  s_Data.TilePipeline.Reset();
+  s_Data.DrawSignature.Reset();
+  s_Data.DepthPrepassPipeline.Reset();
+  s_Data.GPUShadowPipeline.Reset();
+  s_Data.GPUPointShadowPipeline.Reset();
+  s_Data.BloomDownsamplePipeline.Reset();
+  s_Data.BloomUpsamplePipeline.Reset();
   s_Data.PostProcessColor = {};
   s_Data.ShadowMap = {};
   s_Data.PointShadowMap = {};
@@ -2465,10 +2378,6 @@ void DirectX12Renderer::ShutdownSceneRenderer()
   s_Data.SceneRootSignature.Reset();
   s_Data.ScenePipeline.Reset();
   s_Data.LightingPipeline.Reset();
-  s_Data.ShadowRootSignature.Reset();
-  s_Data.ShadowPipeline.Reset();
-  s_Data.PointShadowRootSignature.Reset();
-  s_Data.PointShadowPipeline.Reset();
   s_Data.SkyboxRootSignature.Reset();
   s_Data.SkyboxPipeline.Reset();
   s_Data.ParticleRootSignature.Reset();
@@ -2479,7 +2388,6 @@ void DirectX12Renderer::ShutdownSceneRenderer()
   s_Data.PhysicsDebugPipeline.Reset();
   s_Data.PostRootSignature.Reset();
   s_Data.BloomExtractPipeline.Reset();
-  s_Data.BloomBlurPipeline.Reset();
   s_Data.CompositePipeline.Reset();
   s_Data.PostProcessPipeline.Reset();
   s_Data.UIRootSignature.Reset();
@@ -2549,6 +2457,7 @@ bool DirectX12Renderer::UploadModel(const std::shared_ptr<Model>& model)
           gpuMesh.SpecularDescriptorIndex != s_Data.WhiteTexture.DescriptorIndex;
       }
       s_Data.Meshes[&mesh] = std::move(gpuMesh);
+      s_Data.PointShadowCache = {};
     }
     return true;
   }
@@ -2694,6 +2603,7 @@ bool DirectX12Renderer::BeginFrame()
   try
   {
     WaitForFrame(s_Data.FrameIndex);
+    s_Data.FrameFailed = false;
     auto& allocator = s_Data.CommandAllocators[s_Data.FrameIndex];
     CheckHRESULT(allocator->Reset(), "ID3D12CommandAllocator::Reset");
     CheckHRESULT(s_Data.CommandList->Reset(allocator.Get(), nullptr),
@@ -2759,7 +2669,7 @@ bool DirectX12Renderer::EndFrame(bool vSync)
     s_Data.FrameIndex = s_Data.SwapChain->GetCurrentBackBufferIndex();
     LogD3D12Messages();
     s_Data.FrameStarted = false;
-    return true;
+    return !s_Data.FrameFailed;
   }
   catch (const std::exception& error)
   {
@@ -2806,11 +2716,17 @@ void DirectX12Renderer::DrawScene(DeltaTime& dt, const std::function<void()>& sc
       s_Data.PointShadowMapReadable = false;
       CreatePointShadowMap(pointShadowResolution);
     }
+    PrepareGPUScene(effects);
     DrawShadowMap(effects);
     DrawPointShadowMaps(effects);
+    DispatchGPUCull(false, DirectXViewProjection(), effects);
+    DrawDepthPrepass();
+    BuildHiZ();
+    DispatchGPUCull(true, DirectXViewProjection(), effects);
     BeginGeometryPass();
-    DrawModels(effects);
+    DrawGPUScene(s_Data.ScenePipeline.Get());
     EndGeometryPass();
+    DispatchTileLights(effects);
     DrawLightingPass(effects);
     CompositeLighting(effects);
     DrawSkybox();
@@ -2825,6 +2741,7 @@ void DirectX12Renderer::DrawScene(DeltaTime& dt, const std::function<void()>& sc
   catch (const std::exception& error)
   {
     gablog_log(LOG_ERROR, __FILE__, __LINE__, "DirectX 12 scene rendering failed: %s", error.what());
+    s_Data.FrameFailed = true;
   }
 }
 

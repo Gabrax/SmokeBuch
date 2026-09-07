@@ -1,3 +1,4 @@
+#api OPENGL
 #type COMPUTE
 #version 460 core
 
@@ -152,4 +153,95 @@ void main()
   outputCommandWords[outputWord + 3u] = baseVertexBits;
   outputCommandWords[outputWord + 4u] = cullData.metadata.x;
   outputDrawIDs[compactDrawID] = cullData.metadata.y;
+}
+
+#api DX12
+#include "common/dx12_instance.slang"
+cbuffer CullConstants : register(b0)
+{
+  float4x4 CullViewProjection;
+  uint4 CullParameters; // draw count, use Hi-Z, width, height
+  float4 SnapMargin;
+};
+struct DrawCullData { float4 sphere; uint4 instances; };
+ByteAddressBuffer SourceCommands : register(t0);
+StructuredBuffer<InstanceTransform> SourceTransforms : register(t1);
+StructuredBuffer<DrawCullData> CullData : register(t2);
+Texture2D<float> HiZ : register(t3);
+RWByteAddressBuffer OutputCommands : register(u0);
+RWStructuredBuffer<InstanceTransform> VisibleTransforms : register(u1);
+RWByteAddressBuffer OutputCount : register(u2);
+
+bool SphereVisible(float3 center, float radius)
+{
+  const float4 r0 = CullViewProjection[0], r1 = CullViewProjection[1];
+  const float4 r2 = CullViewProjection[2], r3 = CullViewProjection[3];
+  const float4 planes[6] = {r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2};
+  for (uint i = 0; i < 6; ++i)
+    if (dot(planes[i], float4(center, 1)) < -radius * length(planes[i].xyz)) return false;
+  return true;
+}
+
+bool SphereOccluded(float3 center, float radius)
+{
+  float2 minUV = 1, maxUV = 0;
+  float nearestDepth = 1;
+  for (uint corner = 0; corner < 8; ++corner)
+  {
+    const float3 signValue = float3((corner & 1) != 0 ? 1 : -1,
+      (corner & 2) != 0 ? 1 : -1, (corner & 4) != 0 ? 1 : -1);
+    const float4 clip = mul(CullViewProjection, float4(center + signValue * radius, 1));
+    if (clip.w <= 0.00001f || clip.z <= 0) return false;
+    const float3 ndc = clip.xyz / clip.w;
+    const float2 uv = ndc.xy * float2(0.5f, -0.5f) + 0.5f;
+    minUV = min(minUV, uv);
+    maxUV = max(maxUV, uv);
+    nearestDepth = min(nearestDepth, ndc.z);
+  }
+  minUV = saturate(minUV - SnapMargin.xy);
+  maxUV = saturate(maxUV + SnapMargin.xy);
+  const float2 extent = (maxUV - minUV) * float2(CullParameters.zw);
+  if (max(extent.x, extent.y) < 2) return false;
+  uint width, height, levels;
+  HiZ.GetDimensions(0, width, height, levels);
+  const uint mip = min(uint(ceil(log2(max(max(extent.x, extent.y), 1.0f)))), levels - 1);
+  HiZ.GetDimensions(mip, width, height, levels);
+  const uint2 lo = min(uint2(minUV * float2(width, height)), uint2(width - 1, height - 1));
+  const uint2 hi = min(uint2(maxUV * float2(width, height)), uint2(width - 1, height - 1));
+  float maximumDepth = 0;
+  // Cover every overlapping texel, including boundaries of non-power-of-two mips.
+  for (uint y = lo.y; y <= hi.y; ++y)
+    for (uint x = lo.x; x <= hi.x; ++x)
+      maximumDepth = max(maximumDepth, HiZ.Load(int3(x, y, mip)));
+  return nearestDepth > maximumDepth + 0.0025f;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= CullParameters.x) return;
+  const DrawCullData data = CullData[id.x];
+  if (CullParameters.y == 2 && (data.instances.w & 4) != 0) return;
+  uint visibleCount = 0;
+  for (uint i = 0; i < data.instances.y; ++i)
+  {
+    const InstanceTransform instanceTransform = SourceTransforms[data.instances.x + i];
+    const float4x4 transform = InstanceMatrix(instanceTransform);
+    const float3 center = mul(transform, float4(data.sphere.xyz, 1)).xyz;
+    const float3 scales = float3(
+      length(float3(transform[0][0], transform[1][0], transform[2][0])),
+      length(float3(transform[0][1], transform[1][1], transform[2][1])),
+      length(float3(transform[0][2], transform[1][2], transform[2][2])));
+    const float radius = data.sphere.w * max(max(scales.x, scales.y), scales.z);
+    if (!SphereVisible(center, radius)) continue;
+    if (CullParameters.y == 1 && (data.instances.w & 1) != 0 && SphereOccluded(center, radius)) continue;
+    VisibleTransforms[data.instances.z + visibleCount++] = instanceTransform;
+  }
+  if (visibleCount == 0) return;
+  uint destination;
+  if ((data.instances.w & 2) != 0) OutputCount.InterlockedAdd(4, visibleCount, destination);
+  OutputCount.InterlockedAdd(0, 1, destination);
+  for (uint word = 0; word < 16; ++word)
+    OutputCommands.Store(destination * 64 + word * 4, SourceCommands.Load(id.x * 64 + word * 4));
+  OutputCommands.Store(destination * 64 + 44, visibleCount);
 }

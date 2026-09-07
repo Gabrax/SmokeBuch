@@ -233,6 +233,23 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  if(GABGL_ENABLE_DX12)
+    add_executable(dx12_instance_tests tests/DX12InstanceTests.cpp)
+    target_link_libraries(dx12_instance_tests PRIVATE gabgl_engine d3dcompiler)
+    add_test(NAME dx12_instances COMMAND dx12_instance_tests)
+    set_tests_properties(dx12_instances PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    # Explicitly built/run: desktop/GPU integration is not a headless CTest test.
+    add_executable(renderer_smoke EXCLUDE_FROM_ALL tests/RendererSmoke.cpp)
+    target_link_libraries(renderer_smoke PRIVATE gabgl_engine)
+    if(GABGL_SLANG_DLL)
+      foreach(renderer_test IN ITEMS renderer_smoke dx12_instance_tests)
+        add_custom_command(TARGET ${renderer_test} POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${GABGL_SLANG_DLL}" "$<TARGET_FILE_DIR:${renderer_test}>"
+        )
+      endforeach()
+    endif()
+  endif()
   add_executable(inventory_manager_tests
     tests/InventoryManagerTests.cpp
   )

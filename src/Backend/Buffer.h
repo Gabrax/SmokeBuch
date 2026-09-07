@@ -421,8 +421,7 @@ struct CubemapDirection
 
 struct OmniDirectShadowBuffer
 {
-  OmniDirectShadowBuffer(uint32_t shadowWidth, uint32_t shadowHeight,
-    uint32_t shadowLightCapacity);
+  OmniDirectShadowBuffer(uint32_t shadowWidth, uint32_t shadowHeight, uint32_t shadowLightCapacity);
   ~OmniDirectShadowBuffer();
 
   void Bind() const;
@@ -434,8 +433,8 @@ struct OmniDirectShadowBuffer
 
   inline std::span<const CubemapDirection, 6> GetFaceDirections() const { return m_Directions; }
 
-	static std::shared_ptr<OmniDirectShadowBuffer> Create(uint32_t shadowWidth,
-    uint32_t shadowHeight, uint32_t shadowLightCapacity);
+	static auto Create(uint32_t shadowWidth,
+	                   uint32_t shadowHeight, uint32_t shadowLightCapacity) -> std::shared_ptr<OmniDirectShadowBuffer>;
 
 private:
 

@@ -1,16 +1,6 @@
 > [!IMPORTANT]
 > All rights to the assets belong to their respective authors.
 
-## Project structure
-
-The codebase is split into independent CMake targets:
-
-- `gabgl_engine` contains the platform, input, rendering, audio, physics and generic scene infrastructure from `src/Backend` and `src/Input`.
-- `gabgl_gameplay` contains renderer-independent dialogue and inventory state from `src/Game`.
-- `gabgl_game` is the game executable and composition root. It registers `GameScene`, `MenuScene` and gameplay interaction handlers with the engine. Its output remains `gl_engine.exe` for compatibility.
-
-The dependency direction is one-way: the game links the engine, while the engine does not include or link anything from `src/Game`.
-
 <div align="center">
   
 ## Game preview
@@ -52,21 +42,7 @@ https://github.com/user-attachments/assets/dfeda195-f8d6-4073-aff7-d7bfe55fce39
 
 </div>
 
-## Graphics backends
-
-Shaders for both graphics backends are authored as `.slang` files and compiled
-at runtime with Slang, which keeps shader hot reload available. Install a Slang
-SDK (the Vulkan SDK includes one) and expose it through `VULKAN_SDK`,
-`SLANG_ROOT`, or `CMAKE_PREFIX_PATH` before configuring the project.
-
-The shared shaders live directly in `res/shaders`. Files used by both renderers
-contain `#api OPENGL` and `#api DX12` sections; the runtime selects the matching
-section before asking Slang to compile it. This keeps a single shader path for
-scene rendering, shadows, skyboxes, particles, debug drawing, UI, and
-post-processing while still allowing the two render pipelines to use different
-resource layouts and entry points.
-
-OpenGL remains the default game renderer. On Windows, the optional DirectX 12
+On Windows, the optional DirectX 12
 path can be enabled at configure time and selected without changing the saved
 configuration:
 
@@ -79,36 +55,31 @@ build\gl_engine.exe --renderer=dx12
 Alternatively, set `graphics.api` in `gab.ini` to `"dx12"`. Use
 `--renderer=opengl` to override that setting for a single run.
 
-The DX12 path provides the native device, high-performance adapter selection,
-command queue, double-buffered flip-model swap chain, resize, VSync/tearing
-support, GPU fences, and scene rendering. It uploads the existing model and
-texture assets, renders animated instances with a depth buffer and directional
-lighting, and draws the menu/loading UI through a dedicated DX12 pipeline. The
-DX12 scene path also includes cubemap skyboxes, diffuse/normal/specular
-materials, directional/point/spot lighting, directional and point-light shadow passes, HDR
-tone mapping and bloom, particles/impact marks, interaction labels, and the
-PS1-style 240-line vertex snapping, pixelation, 5-bit color quantization, and
-ordered dithering used by the OpenGL path. The complete ImGui editing workspace
-uses the native DX12 backend and can be toggled with `Tab`.
-
 Both renderers are selected through the same backend contract. Models, particles,
 screen UI, ImGui, debug layers, culling statistics and visual-effect settings are
 submitted without backend-specific branches in scene code, leaving future APIs a
 single interface to implement.
 
-The OpenGL deferred lighting path uses 16x16 tiled light lists. A compute pass
-reduces each G-buffer tile to a conservative world-space volume and assigns only
-the directional, point and spot lights which can affect it. The fullscreen light
-pass consumes those compact lists instead of evaluating every light for every
-pixel. Point-light shadows use four compact cubemap-array slots selected from the
-nearest visible lights; logical light indices are mapped to physical slots each
-frame, so unused lights no longer reserve cubemap layers. Static point-shadow
-maps are cached until the light or a caster inside its range changes, while each
-updated cubemap face receives its own caster-frustum culling pass. The editor's
-Components panel can open a live G-buffer attachment viewer and enable either a
-tiled-light overlay or a full light-density heatmap.
+An opt-in desktop integration test exercises the real scene, DX12 effect quality
+changes, PS1 on/off, particles, editor render targets and odd-size resizing. It also
+supports an OpenGL regression run. Build with `BUILD_TESTING=ON` and
+`GABGL_ENABLE_DX12=ON`, then run from the repository root:
 
-Logging and CPU/OpenGL GPU profiling use GABDEBUG directly at a pinned revision.
-Call sites use its C logging and profiling API without engine-side Logger or
-Profiler wrappers; GABDEBUG owns level filtering, source locations, thread-safe
-output, hierarchical CPU scopes and non-blocking timestamp-query resolution.
+```powershell
+cmake --build cmake-build-release --target renderer_smoke
+./tests/RunRendererSmoke.ps1
+```
+
+Pass `-BuildDirectory` for another build directory. The script checks process exit
+codes and renderer error logs. `GABGL_DX12_VALIDATION=1` enables D3D12 validation in
+Release builds when the Windows debug layer is installed. These integration tests require a
+desktop and scene assets and are intentionally excluded from automatic CTest runs.
+
+The `dx12_instances` CTest regression runs headlessly on D3D12 WARP. It reads back
+positions from the actual scene and shadow vertex shaders through `ExecuteIndirect`,
+covering nonzero instance offsets, translation, rotation, nonuniform scale and skinning.
+DX12 transform buffers store explicit GLM columns; each draw passes its compacted
+instance base in the constant buffer because `SV_InstanceID` starts at zero.
+The same test checks all six point-shadow face projections against cubemap UV
+coordinates. DX12 uses explicit left-handed views and a [0,1] depth projection
+for those faces so rendering and `TextureCube` sampling have the same orientation.

@@ -184,23 +184,12 @@ void main()
 }
 
 #api DX12
-#define MAX_BONES 100
-#define MAX_LIGHTS 32
+#include "common/dx12_scene.slang"
 
-cbuffer SceneConstants : register(b0)
+cbuffer ShadowFrame : register(b1)
 {
-  float4x4 ViewProjection;
-  float4x4 Model;
-  float4x4 LightViewProjection;
-  float4x4 Bones[MAX_BONES];
-  float4 CameraPosition;
-  float4 MaterialFlags;
-  float4 LightPositions[MAX_LIGHTS];
-  float4 LightDirections[MAX_LIGHTS];
-  float4 LightColors[MAX_LIGHTS];
-  float4 LightTypes[MAX_LIGHTS];
-  uint4 LightCount;
-  float4 Resolution;
+  float4x4 ShadowViewProjection;
+  float4 ShadowLightPosition;
 };
 
 #define GABGL_MATRIX4 float4x4
@@ -209,6 +198,12 @@ cbuffer SceneConstants : register(b0)
 #define GABGL_BONE_MATRIX(index) Bones[index]
 #include "common/skinning.slang"
 
+#include "common/dx12_instance.slang"
+StructuredBuffer<InstanceTransform> InstanceTransforms : register(t5);
+StructuredBuffer<uint2> TileGrid : register(t6);
+StructuredBuffer<uint> TileIndices : register(t7);
+StructuredBuffer<float2> ShadowOffsets : register(t8);
+Texture2D MaterialTextures[2048] : register(t0, space1);
 Texture2D DiffuseTexture : register(t0);
 Texture2D NormalTexture : register(t1);
 Texture2D SpecularTexture : register(t2);
@@ -243,12 +238,14 @@ struct PSInput
   float4 shadowPosition : TEXCOORD1;
 };
 
-PSInput VSMain(VSInput input)
+PSInput VSMain(VSInput input, uint instanceID : SV_InstanceID)
 {
   const float4x4 skin = GabglSkinMatrix(
     input.boneIds, input.weights, 0, CameraPosition.w > 0.5f);
-  const float4 worldPosition = mul(Model, mul(skin, float4(input.position, 1.0f)));
-  const float3x3 linearTransform = mul((float3x3)Model, (float3x3)skin);
+  // SV_InstanceID excludes DrawIndexedInstanced's StartInstanceLocation.
+  const float4x4 instanceModel = InstanceMatrix(InstanceTransforms[MaterialIndices.w + instanceID]);
+  const float4 worldPosition = mul(instanceModel, mul(skin, float4(input.position, 1.0f)));
+  const float3x3 linearTransform = mul((float3x3)instanceModel, (float3x3)skin);
   // Cofactor matrix is inverse-transpose up to a scalar determinant. The
   // following normalization removes that scalar and works on Shader Model 5.1,
   // where a matrix inverse intrinsic is unavailable.
@@ -256,9 +253,11 @@ PSInput VSMain(VSInput input)
     cross(linearTransform[1], linearTransform[2]),
     cross(linearTransform[2], linearTransform[0]),
     cross(linearTransform[0], linearTransform[1]));
-  const float3 normal = normalize(mul(normalTransform, input.normal));
+  const float orientation = determinant(linearTransform) < 0.0f ? -1.0f : 1.0f;
+  const float3 normal = normalize(mul(normalTransform, input.normal) * orientation);
   float3 tangent = mul(linearTransform, input.tangent);
-  tangent = normalize(tangent - normal * dot(normal, tangent));
+  tangent = length(tangent) > 0.00001f ? normalize(tangent - normal * dot(normal, tangent))
+    : normalize(abs(normal.y) < 0.999f ? cross(float3(0, 1, 0), normal) : cross(float3(1, 0, 0), normal));
   const float handedness = dot(cross(input.normal, input.tangent), input.bitangent) < 0.0f ? -1.0f : 1.0f;
   PSInput output;
   float4 clipPosition = mul(ViewProjection, worldPosition);
@@ -285,6 +284,18 @@ PSInput VSMain(VSInput input)
   return output;
 }
 
+PSInput ShadowVS(VSInput input, uint instanceID : SV_InstanceID)
+{
+  PSInput output = VSMain(input, instanceID);
+  output.position = mul(ShadowViewProjection, float4(output.worldPosition, 1));
+  return output;
+}
+
+float PointShadowPS(PSInput input) : SV_TARGET
+{
+  return length(input.worldPosition - ShadowLightPosition.xyz);
+}
+
 float ShadowFactor(float4 shadowPosition, float3 normal, float3 lightDirection)
 {
   if (LightCount.y == 0) return 1.0f;
@@ -297,13 +308,17 @@ float ShadowFactor(float4 shadowPosition, float3 normal, float3 lightDirection)
   const float2 texel = 1.0f / float2(width, height);
   const float bias = max(0.0015f * (1.0f - saturate(dot(normal, -lightDirection))), 0.00015f);
   float visibility = 0.0f;
-  for (int y = -1; y <= 1; ++y)
-    for (int x = -1; x <= 1; ++x)
-    {
-      const float depth = ShadowTexture.SampleLevel(ShadowSampler, uv + float2(x, y) * texel, 0).r;
-      visibility += ndc.z - bias <= depth ? 1.0f : 0.15f;
-    }
-  return visibility / 9.0f;
+  // Anchor to shadow texels. Flip the pattern's Y coordinate with the DX viewport.
+  const uint2 pattern = uint2(floor(float2(uv.x, 1.0f - uv.y) * float2(width, height))) % 16;
+  const uint samples = uint(ShadowFilter.x);
+  const uint offsetBase = (pattern.y * 16 + pattern.x) * samples;
+  for (uint i = 0; i < samples; ++i)
+  {
+    const float2 offset = ShadowOffsets[offsetBase + i] * ShadowFilter.y * float2(1, -1);
+    const float depth = ShadowTexture.SampleLevel(ShadowSampler, uv + offset * texel, 0).r;
+    visibility += ndc.z - bias <= depth ? 1.0f : 0.15f;
+  }
+  return visibility / max(float(samples), 1.0f);
 }
 
 float PointShadowFactor(float3 worldPosition, float3 normal, float3 lightPosition,
@@ -314,10 +329,19 @@ float PointShadowFactor(float3 worldPosition, float3 normal, float3 lightPositio
   const float currentDepth = length(fragToLight);
   if (currentDepth >= 20.0f || currentDepth <= 0.0001f) return 1.0f;
   const float3 direction = fragToLight / currentDepth;
-  const float closestDepth = PointShadowTexture.SampleLevel(
-    ShadowSampler, float4(direction, shadowSlotPlusOne - 1.0f), 0).r;
   const float bias = max(0.03f * (1.0f - dot(normal, -direction)), 0.003f);
-  return currentDepth - bias > closestDepth ? 0.15f : 1.0f;
+  uint width, height, elements;
+  PointShadowTexture.GetDimensions(width, height, elements);
+  const float filterRadius = (2.0f / max(float(width), 1.0f)) * (1.0f + 2.0f * currentDepth / 20.0f);
+  const float3 offsets[4] = {float3(1, 1, 1), float3(-1, -1, 1), float3(-1, 1, -1), float3(1, -1, -1)};
+  float occluded = 0;
+  for (uint i = 0; i < 4; ++i)
+  {
+    const float depth = PointShadowTexture.SampleLevel(ShadowSampler,
+      float4(direction + offsets[i] * filterRadius, shadowSlotPlusOne - 1.0f), 0).r;
+    occluded += currentDepth - bias > depth ? 1.0f : 0.0f;
+  }
+  return lerp(1.0f, 0.15f, occluded * 0.25f);
 }
 
 struct GBufferOutput
@@ -329,16 +353,16 @@ struct GBufferOutput
 
 GBufferOutput GBufferPS(PSInput input)
 {
-  const float4 albedoSample = DiffuseTexture.Sample(MaterialSampler, input.uv);
+  const float4 albedoSample = MaterialTextures[MaterialIndices.x].Sample(MaterialSampler, input.uv);
   float3 normal = normalize(input.normal);
   if (MaterialFlags.x > 0.5f)
   {
     normal = GabglApplyTangentNormal(
       normal, input.tangent, input.bitangent,
-      NormalTexture.Sample(MaterialSampler, input.uv).xyz);
+      MaterialTextures[MaterialIndices.y].Sample(MaterialSampler, input.uv).xyz);
   }
   const float specularStrength = MaterialFlags.y > 0.5f
-    ? SpecularTexture.Sample(MaterialSampler, input.uv).r : 0.0f;
+    ? MaterialTextures[MaterialIndices.z].Sample(MaterialSampler, input.uv).r : 0.0f;
 
   GBufferOutput output;
   output.position = float4(input.worldPosition, max(MaterialFlags.z, 1.0f));
@@ -375,8 +399,11 @@ float4 LightingPS(LightingInput input) : SV_TARGET
   const float shininess = GabglMaterialShininess(albedoSpec.a);
   const float4 shadowPosition = mul(LightViewProjection, float4(worldPosition, 1.0f));
   float3 lighting = 0.0f;
-  for (uint i = 0; i < min(LightCount.x, (uint)MAX_LIGHTS); ++i)
+  const uint2 tile = uint2(input.position.xy) / 16;
+  const uint2 tileEntry = TileGrid[tile.y * LightCount.z + tile.x];
+  for (uint lightOffset = 0; lightOffset < tileEntry.y; ++lightOffset)
   {
+    const uint i = TileIndices[tileEntry.x + lightOffset];
     const int type = (int)(LightTypes[i].x + 0.5f);
     const float3 lightColor = LightColors[i].rgb;
     float3 toLight;
@@ -397,7 +424,7 @@ float4 LightingPS(LightingInput input) : SV_TARGET
       const float3 offset = LightPositions[i].xyz - worldPosition;
       const float distanceToLight = max(length(offset), 0.001f);
       toLight = offset / distanceToLight;
-      attenuation = GabglDistanceAttenuation(distanceToLight);
+      attenuation = GabglDistanceAttenuation(distanceToLight) * (1.0f - smoothstep(16.0f, 20.0f, distanceToLight));
       shadow = PointShadowFactor(worldPosition, normal, LightPositions[i].xyz, LightTypes[i].y);
       lighting += GabglEvaluateLight(
         lightColor, albedoSpec.rgb, albedoSpec.aaa, normal, viewDirection,
@@ -408,12 +435,22 @@ float4 LightingPS(LightingInput input) : SV_TARGET
       const float3 offset = LightPositions[i].xyz - worldPosition;
       const float distanceToLight = max(length(offset), 0.001f);
       toLight = offset / distanceToLight;
-      attenuation = GabglDistanceAttenuation(distanceToLight);
+      attenuation = GabglDistanceAttenuation(distanceToLight) * (1.0f - smoothstep(16.0f, 20.0f, distanceToLight));
       intensity = GabglSpotIntensity(-toLight, LightDirections[i].xyz);
       lighting += GabglEvaluateLight(
         lightColor, albedoSpec.rgb, albedoSpec.aaa, normal, viewDirection,
         toLight, shininess, attenuation, intensity, 1.0f);
     }
   }
-  return float4(lighting * max(positionData.a, 1.0f), 1.0f);
+  lighting *= max(positionData.a, 1.0f);
+  if (LightCount.w != 0)
+  {
+    const float density = LightCount.x > 0 ? saturate(float(tileEntry.y) / LightCount.x) : 0.0f;
+    float3 heat = saturate(float3(1.5f - abs(4.0f * density - 3.0f),
+      1.5f - abs(4.0f * density - 2.0f), 1.5f - abs(4.0f * density - 1.0f)));
+    const bool border = (uint(input.position.x) % 16 == 0) || (uint(input.position.y) % 16 == 0);
+    if (border) heat = 0.02f;
+    lighting = LightCount.w == 1 ? lerp(lighting, heat, border ? 0.85f : 0.55f) : heat;
+  }
+  return float4(lighting, 1.0f);
 }

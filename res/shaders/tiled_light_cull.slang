@@ -1,3 +1,4 @@
+#api OPENGL
 #type COMPUTE
 #version 460 core
 
@@ -115,4 +116,51 @@ void main()
   if (localIndex == 0u)
     tileLightGrid[tileIndex] = uvec2(
       tileIndex * MAX_LIGHTS_PER_TILE, storedLightCount);
+}
+
+#api DX12
+#include "common/dx12_scene.slang"
+Texture2D<float4> Positions : register(t0);
+RWStructuredBuffer<uint2> TileGrid : register(u0);
+RWStructuredBuffer<uint> TileIndices : register(u1);
+groupshared float4 MinimumPositions[256];
+groupshared float3 MaximumPositions[256];
+groupshared uint TileLightCount;
+groupshared uint LightIndices[MAX_LIGHTS];
+
+[numthreads(16, 16, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+  uint width, height;
+  Positions.GetDimensions(width, height);
+  const float4 position = all(id.xy < uint2(width, height)) ? Positions.Load(int3(id.xy, 0)) : float4(0);
+  MinimumPositions[lane] = position.a > 0 ? float4(position.xyz, 1) : float4(3.402823e38f, 3.402823e38f, 3.402823e38f, 0);
+  MaximumPositions[lane] = position.a > 0 ? position.xyz : float3(-3.402823e38f);
+  if (lane == 0) TileLightCount = 0;
+  GroupMemoryBarrierWithGroupSync();
+  for (uint stride = 128; stride > 0; stride >>= 1)
+  {
+    if (lane < stride)
+    {
+      MinimumPositions[lane].xyz = min(MinimumPositions[lane].xyz, MinimumPositions[lane + stride].xyz);
+      MinimumPositions[lane].w = max(MinimumPositions[lane].w, MinimumPositions[lane + stride].w);
+      MaximumPositions[lane] = max(MaximumPositions[lane], MaximumPositions[lane + stride]);
+    }
+    GroupMemoryBarrierWithGroupSync();
+  }
+  if (MinimumPositions[0].w > 0 && lane < min(LightCount.x, uint(MAX_LIGHTS)))
+  {
+    const float3 closest = clamp(LightPositions[lane].xyz, MinimumPositions[0].xyz, MaximumPositions[0]);
+    const float3 offset = LightPositions[lane].xyz - closest;
+    if (LightTypes[lane].x < 0.5f || dot(offset, offset) <= 400.0f)
+    {
+      uint slot;
+      InterlockedAdd(TileLightCount, 1, slot);
+      LightIndices[slot] = lane;
+    }
+  }
+  GroupMemoryBarrierWithGroupSync();
+  const uint tileIndex = group.y * LightCount.z + group.x;
+  if (lane < TileLightCount) TileIndices[tileIndex * MAX_LIGHTS + lane] = LightIndices[lane];
+  if (lane == 0) TileGrid[tileIndex] = uint2(tileIndex * MAX_LIGHTS, TileLightCount);
 }

@@ -1,3 +1,4 @@
+#api OPENGL
 #type VERTEX
 #version 330 core
 
@@ -126,5 +127,44 @@ void main()
 	  downsample += (j+k+l+m)*0.125;       // ok
 	  break;
 	}
+}
+
+#api DX12
+cbuffer PostConstants : register(b0) { float4 Params; float4 EffectParams; };
+Texture2D SourceTexture : register(t0);
+SamplerState LinearSampler : register(s0);
+struct PSInput { float4 position : SV_POSITION; float2 uv : TEXCOORD; };
+float KarisAverage(float3 color)
+{
+  return 1.0f / (1.0f + dot(pow(max(color, 0.0f), 1.0f / 2.2f), float3(0.299f, 0.587f, 0.114f)) * 0.25f);
+}
+float4 PSMain(PSInput input) : SV_TARGET
+{
+  const float2 t = 1.0f / Params.xy;
+  const float2 uv = input.uv;
+  const float3 a = SourceTexture.Sample(LinearSampler, uv + t * float2(-2, 2)).rgb;
+  const float3 b = SourceTexture.Sample(LinearSampler, uv + t * float2(0, 2)).rgb;
+  const float3 c = SourceTexture.Sample(LinearSampler, uv + t * float2(2, 2)).rgb;
+  const float3 d = SourceTexture.Sample(LinearSampler, uv + t * float2(-2, 0)).rgb;
+  const float3 e = SourceTexture.Sample(LinearSampler, uv).rgb;
+  const float3 f = SourceTexture.Sample(LinearSampler, uv + t * float2(2, 0)).rgb;
+  const float3 g = SourceTexture.Sample(LinearSampler, uv + t * float2(-2, -2)).rgb;
+  const float3 h = SourceTexture.Sample(LinearSampler, uv + t * float2(0, -2)).rgb;
+  const float3 i = SourceTexture.Sample(LinearSampler, uv + t * float2(2, -2)).rgb;
+  const float3 j = SourceTexture.Sample(LinearSampler, uv + t * float2(-1, 1)).rgb;
+  const float3 k = SourceTexture.Sample(LinearSampler, uv + t * float2(1, 1)).rgb;
+  const float3 l = SourceTexture.Sample(LinearSampler, uv + t * float2(-1, -1)).rgb;
+  const float3 m = SourceTexture.Sample(LinearSampler, uv + t * float2(1, -1)).rgb;
+  float3 result;
+  if (Params.z < 0.5f)
+  {
+    float3 groups[5] = {(a+b+d+e)*0.03125f, (b+c+e+f)*0.03125f,
+      (d+e+g+h)*0.03125f, (e+f+h+i)*0.03125f, (j+k+l+m)*0.125f};
+    result = 0;
+    for (uint n = 0; n < 5; ++n) result += groups[n] * KarisAverage(groups[n]);
+    result = max(result, 0.0001f);
+  }
+  else result = e*0.125f + (a+c+g+i)*0.03125f + (b+d+f+h)*0.0625f + (j+k+l+m)*0.125f;
+  return float4(result, 1);
 }
 
