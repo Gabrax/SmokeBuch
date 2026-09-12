@@ -37,8 +37,14 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL 
 endif()
 
 option(GABGL_ENABLE_DX12 "Build the optional DirectX 12 backend" ${WIN32})
+find_package(Vulkan QUIET)
+option(GABGL_ENABLE_VULKAN "Build the Vulkan backend" ${Vulkan_FOUND})
 
-# Slang is the single source-language compiler for both OpenGL and DirectX 12.
+if(GABGL_ENABLE_VULKAN AND NOT Vulkan_FOUND)
+  find_package(Vulkan REQUIRED)
+endif()
+
+# Slang is the single source-language compiler for the graphics backends.
 # The Vulkan SDK ships a complete Slang SDK; standalone Slang installations are
 # also supported through CMAKE_PREFIX_PATH or SLANG_ROOT.
 find_package(slang CONFIG QUIET)
@@ -209,6 +215,11 @@ target_link_libraries(gabgl_engine PUBLIC
   SndFile::sndfile OpenAL::OpenAL freetype gabdebug::gabdebug ${GABGL_SLANG_TARGET}
 )
 
+if(GABGL_ENABLE_VULKAN)
+  target_compile_definitions(gabgl_engine PRIVATE GABGL_ENABLE_VULKAN=1)
+  target_link_libraries(gabgl_engine PRIVATE Vulkan::Vulkan)
+endif()
+
 if(WIN32 AND NOT TARGET slang::slang)
   find_file(GABGL_SLANG_DLL
     NAMES slang-compiler.dll slang.dll
@@ -238,17 +249,29 @@ if(BUILD_TESTING)
     target_link_libraries(dx12_instance_tests PRIVATE gabgl_engine d3dcompiler)
     add_test(NAME dx12_instances COMMAND dx12_instance_tests)
     set_tests_properties(dx12_instances PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
-    # Explicitly built/run: desktop/GPU integration is not a headless CTest test.
-    add_executable(renderer_smoke EXCLUDE_FROM_ALL tests/RendererSmoke.cpp)
-    target_link_libraries(renderer_smoke PRIVATE gabgl_engine)
     if(GABGL_SLANG_DLL)
-      foreach(renderer_test IN ITEMS renderer_smoke dx12_instance_tests)
+      foreach(renderer_test IN ITEMS dx12_instance_tests)
         add_custom_command(TARGET ${renderer_test} POST_BUILD
           COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${GABGL_SLANG_DLL}" "$<TARGET_FILE_DIR:${renderer_test}>"
         )
       endforeach()
     endif()
+  endif()
+  if(GABGL_ENABLE_DX12 OR GABGL_ENABLE_VULKAN)
+    # Explicitly built/run: desktop/GPU integration is not a headless CTest test.
+    add_executable(renderer_smoke EXCLUDE_FROM_ALL tests/RendererSmoke.cpp)
+    target_link_libraries(renderer_smoke PRIVATE gabgl_engine)
+    if(GABGL_SLANG_DLL)
+      add_custom_command(TARGET renderer_smoke POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${GABGL_SLANG_DLL}" "$<TARGET_FILE_DIR:renderer_smoke>"
+      )
+    endif()
+  endif()
+  if(GABGL_ENABLE_VULKAN)
+    add_executable(vulkan_bootstrap_smoke EXCLUDE_FROM_ALL tests/VulkanBootstrapSmoke.cpp)
+    target_link_libraries(vulkan_bootstrap_smoke PRIVATE gabgl_engine)
   endif()
   add_executable(inventory_manager_tests
     tests/InventoryManagerTests.cpp

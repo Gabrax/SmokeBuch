@@ -74,9 +74,9 @@ Shader::Bytecode CompileSlangSource(const std::string& source,
   // the explicit GLSL buffer qualifier. OpenGL therefore needs row-major here
   // to retain column-major UBO/SSBO storage, while DXBC must keep the original
   // HLSL column-major constant-buffer ABI used by GLM uploads.
-  sessionDescription.defaultMatrixLayoutMode = format == SLANG_DXBC
-    ? SLANG_MATRIX_LAYOUT_COLUMN_MAJOR
-    : SLANG_MATRIX_LAYOUT_ROW_MAJOR;
+  sessionDescription.defaultMatrixLayoutMode = format == SLANG_GLSL
+    ? SLANG_MATRIX_LAYOUT_ROW_MAJOR
+    : SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
   sessionDescription.targets = &target;
   sessionDescription.targetCount = 1;
   sessionDescription.searchPaths = searchPaths;
@@ -557,6 +557,28 @@ Shader::Bytecode Shader::CompileSlang(const std::filesystem::path& path, std::st
     path, entryPoint, stage, SLANG_DXBC, std::string(target).c_str(), false);
 #else
   gablog_log(LOG_ERROR, __FILE__, __LINE__, "Cannot compile Slang shader '%s': DirectX 12 support is not enabled",
+    path.string().c_str());
+  return {};
+#endif
+}
+
+Shader::Bytecode Shader::CompileSlangSPIRV(const std::filesystem::path& path,
+                                           std::string_view entryPoint,
+                                           std::string_view stageName)
+{
+#if defined(GABGL_ENABLE_VULKAN)
+  SlangStage stage = SLANG_STAGE_NONE;
+  if (stageName == "vertex") stage = SLANG_STAGE_VERTEX;
+  else if (stageName == "fragment") stage = SLANG_STAGE_FRAGMENT;
+  else if (stageName == "compute") stage = SLANG_STAGE_COMPUTE;
+  if (stage == SLANG_STAGE_NONE)
+    throw std::runtime_error("Unsupported Vulkan shader stage: " + std::string(stageName));
+
+  return CompileSlangSource(
+    SelectApiSection(ReadTextFile(path), "VULKAN", path),
+    path, entryPoint, stage, SLANG_SPIRV, "spirv_1_5", false);
+#else
+  gablog_log(LOG_ERROR, __FILE__, __LINE__, "Cannot compile Slang shader '%s': Vulkan support is not enabled",
     path.string().c_str());
   return {};
 #endif

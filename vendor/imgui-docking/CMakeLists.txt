@@ -20,6 +20,13 @@ target_sources(imgui PRIVATE
 target_link_libraries(imgui PUBLIC d3d12)
 endif()
 
+if(GABGL_ENABLE_VULKAN)
+target_sources(imgui PRIVATE
+"${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends/imgui_impl_vulkan.cpp"
+)
+target_link_libraries(imgui PUBLIC Vulkan::Vulkan)
+endif()
+
 target_include_directories(imgui PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
 
 

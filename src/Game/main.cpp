@@ -30,11 +30,14 @@ namespace
     {
       if (const std::string_view argument(argv[i]); argument == "--dx12" || argument == "--renderer=dx12")
         api = GraphicsAPI::DirectX12;
+      else if (argument == "--vulkan" || argument == "--renderer=vulkan")
+        api = GraphicsAPI::Vulkan;
       else if (argument == "--opengl" || argument == "--renderer=opengl")
         api = GraphicsAPI::OpenGL;
       else if (argument == "--renderer" && i + 1 < argc)
       {
         if (const std::string_view value(argv[++i]); value == "dx12" || value == "directx12") api = GraphicsAPI::DirectX12;
+        else if (value == "vulkan" || value == "vk") api = GraphicsAPI::Vulkan;
         else if (value == "opengl") api = GraphicsAPI::OpenGL;
       }
     }
@@ -74,6 +77,8 @@ int main(int argc, char** argv)
     gablog_log(LOG_ERROR, __FILE__, __LINE__, "Could not initialize the %s backend", RenderBackend::Get().GetName());
     if (graphicsAPI == GraphicsAPI::DirectX12)
       gablog_log(LOG_ERROR, __FILE__, __LINE__, "Configure with -DGABGL_ENABLE_DX12=ON to include DirectX 12");
+    else if (graphicsAPI == GraphicsAPI::Vulkan)
+      gablog_log(LOG_ERROR, __FILE__, __LINE__, "Configure with -DGABGL_ENABLE_VULKAN=ON and a Vulkan SDK");
     Window::Terminate();
     return 1;
   }

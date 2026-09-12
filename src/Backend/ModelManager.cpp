@@ -301,7 +301,8 @@ void ModelManager::BakeModel(const std::string& path, const std::shared_ptr<Mode
       for (auto& texture : mesh.m_Textures)
         if (texture) texture->ClearRawData();
 
-    gablog_log(LOG_WARN, __FILE__, __LINE__, "Model: %s DX12 upload took %.3f ms", name.c_str(), timer.ElapsedMillis());
+    gablog_log(LOG_WARN, __FILE__, __LINE__, "Model: %s %s upload took %.3f ms",
+      name.c_str(), RenderBackend::Get().GetName(), timer.ElapsedMillis());
     return;
   }
 

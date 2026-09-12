@@ -28,6 +28,10 @@ namespace
     void OnUpdate(DeltaTime& dt) override
     {
       RenderBackend::Get().DrawScene(dt, [] {}, true, editor, effects);
+      RenderBackend::Get().BeginUI();
+      RenderBackend::Get().DrawText(FontManager::GetFont("dpcomic"), "Vulkan UI atlas",
+        glm::vec2(180.0f, 60.0f), 0.35f, glm::vec4(1.0f));
+      RenderBackend::Get().EndUI();
     }
   };
 }
@@ -36,7 +40,9 @@ int main(int argc, char** argv)
 {
   gablog_set_level(LOG_INFO);
   Settings::Init();
-  const auto api = argc > 1 && std::string_view(argv[1]) == "--opengl" ? GraphicsAPI::OpenGL : GraphicsAPI::DirectX12;
+  GraphicsAPI api = GraphicsAPI::DirectX12;
+  if (argc > 1 && std::string_view(argv[1]) == "--opengl") api = GraphicsAPI::OpenGL;
+  else if (argc > 1 && std::string_view(argv[1]) == "--vulkan") api = GraphicsAPI::Vulkan;
   RenderBackend::Select(api);
   Window::Init("GABGL pipeline smoke", 1280, 720, api);
   auto& backend = RenderBackend::Get();
@@ -67,6 +73,10 @@ int main(int argc, char** argv)
       effects.ShadowQuality = static_cast<GraphicsQuality>((renderedFrames / 32) % 4);
       effects.PS1Enabled = (renderedFrames / 8) % 2 == 0;
       editor = renderedFrames >= 80 && renderedFrames < 112;
+      if (renderedFrames == 24)
+        backend.SetModelPreviews({{"pistol", glm::mat4(1.0f), 1.8f}});
+      else if (renderedFrames == 40)
+        backend.SetModelPreviews({});
       RenderBackend::DebugSettings().TiledLightingMode = (renderedFrames / 16) % 3;
       if (renderedFrames % 16 == 0)
         std::cout << "phase frame=" << renderedFrames << " bloom=" << int(effects.BloomQuality)
@@ -77,6 +87,8 @@ int main(int argc, char** argv)
       ++renderedFrames;
     }
     SceneManager::Update(dt);
+    if (editor && backend.GetAPI() == GraphicsAPI::Vulkan)
+      passed &= backend.GetEditorTextureID() != 0;
     maximumVisible = std::max(maximumVisible, RenderBackend::Statistics().VisibleInstances);
     if (!backend.EndFrame(false)) { passed = false; break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));

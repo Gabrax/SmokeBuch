@@ -55,15 +55,35 @@ build\gl_engine.exe --renderer=dx12
 Alternatively, set `graphics.api` in `gab.ini` to `"dx12"`. Use
 `--renderer=opengl` to override that setting for a single run.
 
-Both renderers are selected through the same backend contract. Models, particles,
+The Vulkan backend can be built and selected in the same way:
+
+```powershell
+cmake -S . -B build -DGABGL_ENABLE_VULKAN=ON
+cmake --build build --config Release
+build\gl_engine.exe --renderer=vulkan
+```
+
+The Vulkan backend owns the instance, physical/logical device, presentation queues,
+resize-safe swapchain, frame synchronization, VSync present-mode changes and Dear
+ImGui renderer. Its SPIR-V scene path includes skinned diffuse/normal/specular
+materials, a three-target G-buffer, deferred directional/point/spot lighting,
+GPU-culled directional and cached cubemap point shadows, native skyboxes, a depth
+prepass with same-frame Hi-Z occlusion and indirect draws, tiled light lists, alpha-blended particles, debug and
+physics lines, editor render targets, model previews, and HDR post-processing with
+a bloom pyramid, gamma and PS1 color/geometry modes. Set
+`GABGL_VULKAN_VALIDATION=1` to request Khronos validation when the layer is installed.
+The focused presentation smoke test is available as the
+`vulkan_bootstrap_smoke` build target.
+
+All renderers are selected through the same backend contract. Models, particles,
 screen UI, ImGui, debug layers, culling statistics and visual-effect settings are
 submitted without backend-specific branches in scene code, leaving future APIs a
 single interface to implement.
 
-An opt-in desktop integration test exercises the real scene, DX12 effect quality
+An opt-in desktop integration test exercises the real scene, DX12/Vulkan effect quality
 changes, PS1 on/off, particles, editor render targets and odd-size resizing. It also
-supports an OpenGL regression run. Build with `BUILD_TESTING=ON` and
-`GABGL_ENABLE_DX12=ON`, then run from the repository root:
+supports an OpenGL regression run. Build with `BUILD_TESTING=ON` and the desired
+native backends enabled, then run from the repository root:
 
 ```powershell
 cmake --build cmake-build-release --target renderer_smoke
@@ -71,8 +91,8 @@ cmake --build cmake-build-release --target renderer_smoke
 ```
 
 Pass `-BuildDirectory` for another build directory. The script checks process exit
-codes and renderer error logs. `GABGL_DX12_VALIDATION=1` enables D3D12 validation in
-Release builds when the Windows debug layer is installed. These integration tests require a
+codes and renderer error logs. `GABGL_DX12_VALIDATION=1` and
+`GABGL_VULKAN_VALIDATION=1` enable their respective validation layers. These integration tests require a
 desktop and scene assets and are intentionally excluded from automatic CTest runs.
 
 The `dx12_instances` CTest regression runs headlessly on D3D12 WARP. It reads back

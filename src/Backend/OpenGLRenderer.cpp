@@ -3544,7 +3544,14 @@ void OpenGLRenderer::DrawEditorFrameBuffer(uint64_t framebufferTexture)
 	const auto textureID = reinterpret_cast<ImTextureID>(static_cast<uintptr_t>(framebufferTexture));
 	const ImVec2 uv0 = capabilities.FramebufferOriginBottomLeft ? ImVec2{0, 1} : ImVec2{0, 0};
 	const ImVec2 uv1 = capabilities.FramebufferOriginBottomLeft ? ImVec2{1, 0} : ImVec2{1, 1};
-	ImGui::Image(textureID, ImVec2{ s_Data.m_ViewportSize.x, s_Data.m_ViewportSize.y }, uv0, uv1);
+	if (framebufferTexture != 0)
+		ImGui::Image(textureID, ImVec2{ s_Data.m_ViewportSize.x, s_Data.m_ViewportSize.y }, uv0, uv1);
+	else
+	{
+		ImGui::Dummy(ImVec2{ s_Data.m_ViewportSize.x, s_Data.m_ViewportSize.y });
+		ImGui::SetCursorPos(ImVec2{16.0f, 36.0f});
+		ImGui::TextDisabled("Scene target is not implemented by %s yet.", RenderBackend::Get().GetName());
+	}
 
 	ImGui::End();
 	ImGui::PopStyleVar();

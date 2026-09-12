@@ -50,6 +50,9 @@ struct Shader
   static void Create(std::shared_ptr<Shader>& shader, const char* vertexPath, const char* fragmentPath, const char* geometryPath = nullptr);
   static Bytecode CompileSlang(const std::filesystem::path& path, std::string_view entryPoint,
                                std::string_view target);
+  static Bytecode CompileSlangSPIRV(const std::filesystem::path& path,
+                                    std::string_view entryPoint,
+                                    std::string_view stage);
 
 private:
   int GetUniformLocation(const std::string& name) const;

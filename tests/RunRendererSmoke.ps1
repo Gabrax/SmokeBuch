@@ -4,9 +4,11 @@ $renderBuild = (Resolve-Path -LiteralPath $BuildDirectory).Path
 $renderExe = Join-Path $renderBuild 'renderer_smoke.exe'
 if (-not (Test-Path -LiteralPath $renderExe)) { throw "Build the renderer_smoke target first." }
 $previousValidation = $env:GABGL_DX12_VALIDATION
+$previousVulkanValidation = $env:GABGL_VULKAN_VALIDATION
 try {
     $env:GABGL_DX12_VALIDATION = '1'
-    foreach ($backend in @('dx12', 'opengl')) {
+    $env:GABGL_VULKAN_VALIDATION = '1'
+    foreach ($backend in @('dx12', 'opengl', 'vulkan')) {
         $stdout = Join-Path $renderBuild "$backend-pipeline-check.stdout.log"
         $stderr = Join-Path $renderBuild "$backend-pipeline-check.stderr.log"
         Write-Output "Starting $backend integration test"
@@ -19,6 +21,7 @@ try {
             PassThru = $true
         }
         if ($backend -eq 'opengl') { $launch.ArgumentList = '--opengl' }
+        if ($backend -eq 'vulkan') { $launch.ArgumentList = '--vulkan' }
         $renderProcess = Start-Process @launch
         # Retain the process handle so Windows PowerShell can read ExitCode
         # after a short-lived child has already exited.
@@ -32,8 +35,9 @@ try {
         if ($renderProcess.ExitCode -ne 0 -or $logs -match '\[ERROR\]|smoke FAIL' -or $logs -notmatch 'smoke PASS') {
             throw "$backend integration test failed (exit $($renderProcess.ExitCode)). See $stdout and $stderr"
         }
-        ($logs -split "`n" | Where-Object { $_ -match 'smoke PASS|D3D12 validation' }) | Write-Output
+        ($logs -split "`n" | Where-Object { $_ -match 'smoke PASS|D3D12 validation|Vulkan validation' }) | Write-Output
     }
 } finally {
     $env:GABGL_DX12_VALIDATION = $previousValidation
+    $env:GABGL_VULKAN_VALIDATION = $previousVulkanValidation
 }

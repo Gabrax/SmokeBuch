@@ -77,7 +77,8 @@ void Settings::Save()
   };
 
   j["graphics"] = {
-    {"api", m_GraphicsAPI == GraphicsAPI::DirectX12 ? "dx12" : "opengl"},
+    {"api", m_GraphicsAPI == GraphicsAPI::DirectX12 ? "dx12"
+      : m_GraphicsAPI == GraphicsAPI::Vulkan ? "vulkan" : "opengl"},
     {"shadows", static_cast<uint32_t>(m_ShadowQuality)},
     {"bloom", static_cast<uint32_t>(m_BloomQuality)}
   };
@@ -121,7 +122,9 @@ void Settings::Load()
     const std::string graphicsAPI = graphics.value("api", "opengl");
     m_GraphicsAPI = graphicsAPI == "dx12" || graphicsAPI == "directx12"
       ? GraphicsAPI::DirectX12
-      : GraphicsAPI::OpenGL;
+      : graphicsAPI == "vulkan" || graphicsAPI == "vk"
+        ? GraphicsAPI::Vulkan
+        : GraphicsAPI::OpenGL;
     m_ShadowQuality = static_cast<GraphicsQuality>(
       std::min(graphics.value("shadows", static_cast<uint32_t>(GraphicsQuality::Medium)), 3u));
     m_BloomQuality = static_cast<GraphicsQuality>(

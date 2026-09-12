@@ -23,6 +23,7 @@ bool RenderBackend::Select(const GraphicsAPI api)
 {
   switch (api)
   {
+    case GraphicsAPI::Vulkan: s_Backend = CreateVulkanRenderBackend(); break;
     case GraphicsAPI::DirectX12: s_Backend = CreateDirectX12RenderBackend(); break;
     case GraphicsAPI::OpenGL: s_Backend = CreateOpenGLRenderBackend(); break;
     default: return false;
