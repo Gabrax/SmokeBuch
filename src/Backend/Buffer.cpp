@@ -804,7 +804,7 @@ BloomBuffer::BloomBuffer(const std::shared_ptr<Shader>& downsampleShader, const 
 	m_hdrFB = FrameBuffer::Create(hdrSpec); 
 
   FramebufferSpecification mipFBOspec;
-  mipFBOspec.Attachments = { FramebufferTextureFormat::R11F_G11F_B10F};
+  mipFBOspec.Attachments = { FramebufferTextureFormat::RGBA16F};
   mipFBOspec.Width = windowWidth;
   mipFBOspec.Height = windowHeight;
   m_mipFB = FrameBuffer::Create(mipFBOspec);
@@ -830,7 +830,7 @@ BloomBuffer::BloomBuffer(const std::shared_ptr<Shader>& downsampleShader, const 
     mip.intSize = mipIntSize;
 
     glCreateTextures(GL_TEXTURE_2D, 1, &mip.texture);
-    glTextureStorage2D(mip.texture, 1, GL_R11F_G11F_B10F, mip.intSize.x, mip.intSize.y);
+    glTextureStorage2D(mip.texture, 1, GL_RGBA16F, mip.intSize.x, mip.intSize.y);
 
     glTextureParameteri(mip.texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTextureParameteri(mip.texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -937,7 +937,7 @@ void BloomBuffer::Resize(int newWidth, int newHeight)
 
       glCreateTextures(GL_TEXTURE_2D, 1, &mip.texture);
 
-      glTextureStorage2D(mip.texture, 1, GL_R11F_G11F_B10F, mip.intSize.x, mip.intSize.y);
+      glTextureStorage2D(mip.texture, 1, GL_RGBA16F, mip.intSize.x, mip.intSize.y);
 
       glTextureParameteri(mip.texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       glTextureParameteri(mip.texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);

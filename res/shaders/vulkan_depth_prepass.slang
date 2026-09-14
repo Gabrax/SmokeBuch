@@ -11,9 +11,9 @@ struct SceneFrameData
   float4x4 LightViewProjection;
   float4x4 InverseViewProjection;
   float4 CameraPosition;
-  float4 LightPositions[32];
-  float4 LightDirections[32];
-  float4 LightColors[32];
+  float4 LightPositions[128];
+  float4 LightDirections[128];
+  float4 LightColors[128];
   float4 Params;
   float4 Effects;
   float4 ShadowInfo;
@@ -49,13 +49,14 @@ float4 VSMain(VertexInput input) : SV_Position
                         mul(model, mul(skin, float4(input.Position, 1.0f))));
   if (Frame.Params.z > 0.5f && position.w > 0.00001f)
   {
+    const float2 outputResolution = max(Frame.ViewportInfo.xy, float2(1.0f));
     const float virtualHeight = max(Frame.ViewportInfo.w, 1.0f);
-    const float virtualWidth = virtualHeight * Frame.ViewportInfo.x /
-                               max(Frame.ViewportInfo.y, 1.0f);
-    const float2 virtualResolution = float2(virtualWidth, virtualHeight);
+    const float2 virtualResolution = float2(
+      max(floor(virtualHeight * outputResolution.x / outputResolution.y + 0.5f), 1.0f),
+      virtualHeight);
     float2 ndc = position.xy / position.w;
-    ndc = (floor((ndc * 0.5f + 0.5f) * virtualResolution) + 0.5f) /
-          virtualResolution * 2.0f - 1.0f;
+    ndc = (floor((ndc * 0.5f + 0.5f) * virtualResolution + 0.5f) /
+           virtualResolution) * 2.0f - 1.0f;
     position.xy = ndc * position.w;
   }
   return position;

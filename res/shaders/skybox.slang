@@ -43,7 +43,7 @@ void main()
 {
     vec3 skyTexture = texture(skybox, TexCoords).rgb;
 
-    FragColor = vec4(skyTexture, 1.0);
+    FragColor = vec4(skyTexture * 0.65, 1.0);
 }
 
 #api DX12

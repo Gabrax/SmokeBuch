@@ -109,15 +109,25 @@ FetchContent_Declare(
     GIT_TAG 1.23.1 
 )
 
-# GABDEBUG supplies the engine logger and the CPU/OpenGL GPU profiler. Pin the
-# exact revision so diagnostics do not change underneath reproducible builds.
+# GABDEBUG supplies the engine logger and the CPU/GPU profiler. Pin the exact
+# 0.3.0 revision so diagnostics do not change underneath reproducible builds.
 FetchContent_Declare(
     gabdebug
     GIT_REPOSITORY https://github.com/Gabrax/GABDEBUG.git
-    GIT_TAG 7be0eeb3b945423d872dc944e4f0644fd4a688e8
+    GIT_TAG d724c84a5690e507c7d8f7cd32298a6af759fe4a
 )
 set(GABDEBUG_BUILD_TESTS OFF CACHE BOOL "Disable dependency tests" FORCE)
-set(GABDEBUG_GPU_API OPENGL CACHE STRING "Use GABDEBUG's OpenGL profiler adapter" FORCE)
+set(_gabgl_gabdebug_gpu_apis OPENGL)
+if(GABGL_ENABLE_VULKAN)
+    list(APPEND _gabgl_gabdebug_gpu_apis VULKAN)
+endif()
+if(GABGL_ENABLE_DX12 AND WIN32)
+    list(APPEND _gabgl_gabdebug_gpu_apis D3D12)
+endif()
+# Clear the deprecated single-backend cache entry left by older build trees.
+unset(GABDEBUG_GPU_API CACHE)
+set(GABDEBUG_GPU_APIS "${_gabgl_gabdebug_gpu_apis}" CACHE STRING
+    "Build GABDEBUG profiler adapters used by GABGL" FORCE)
 
 set(LIBTYPE STATIC CACHE STRING "Build static OpenAL Soft" FORCE)
 # Freetype

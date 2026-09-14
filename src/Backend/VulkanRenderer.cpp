@@ -1,8 +1,11 @@
 #include "VulkanRenderer.h"
 
+#include "DirectX12ShadowMath.h"
+
 #if defined(GABGL_ENABLE_VULKAN)
 
 #include <vulkan/vulkan.h>
+#include <gabdebug_gpu_vulkan.h>
 
 #include "AudioManager.h"
 #include "Camera.h"
@@ -33,6 +36,7 @@
 #include <filesystem>
 #include <limits>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -41,14 +45,14 @@
 namespace
 {
   constexpr uint32_t FramesInFlight = 2;
-  constexpr uint32_t MaxSceneLights = 32;
+  constexpr uint32_t MaxSceneLights = 128;
   constexpr uint32_t MaxPointShadowLights = 4;
   constexpr float PointShadowRadius = 20.0f;
   constexpr uint32_t MaxParticleVertices = 4096;
   constexpr uint32_t MaxDebugLineVertices = 131072;
   constexpr uint32_t MaxBloomMips = 6;
   constexpr uint32_t TileSize = 16;
-  constexpr uint32_t MaxTileLights = 32;
+  constexpr uint32_t MaxTileLights = 128;
   constexpr uint32_t MaxHiZMips = 16;
   constexpr VkFormat SceneColorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
   constexpr std::array<const char*, 1> DeviceExtensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -96,6 +100,7 @@ namespace
   {
     glm::mat4 ModelViewProjection;
     glm::vec4 DrawParams{1.0f, 0.0f, 0.0f, 0.0f}; // brightness, transform offset
+    glm::vec4 ShadowLightPosition{0.0f};
   };
   static_assert(sizeof(ScenePushConstants) <= 128);
 
@@ -123,6 +128,7 @@ namespace
   {
     glm::mat4 ViewProjection{1.0f};
     glm::uvec4 Params{0u};
+    glm::vec4 SnapMargin{0.0f};
   };
 
   struct GPUCullFrame
@@ -172,6 +178,7 @@ namespace
 
   struct PointShadowFrame
   {
+    DepthAttachment Depth;
     std::array<PointShadowCube, MaxPointShadowLights> Cubes{};
   };
 
@@ -212,6 +219,11 @@ namespace
     glm::vec4 Resolution{1.0f};
   };
 
+  struct BloomPushConstants
+  {
+    glm::vec4 Params{0.0f};
+  };
+
   struct VulkanData
   {
     VkInstance Instance = VK_NULL_HANDLE;
@@ -223,6 +235,9 @@ namespace
     VkQueue PresentQueue = VK_NULL_HANDLE;
     uint32_t GraphicsQueueFamily = 0;
     uint32_t PresentQueueFamily = 0;
+    bool ProfilerInstalled = false;
+    bool ProfilerUsed = false;
+    bool ProfilerFrameActive = false;
 
     VkSwapchainKHR Swapchain = VK_NULL_HANDLE;
     VkFormat SwapchainFormat = VK_FORMAT_UNDEFINED;
@@ -232,17 +247,27 @@ namespace
     std::vector<VkFramebuffer> Framebuffers;
     std::vector<VkFramebuffer> DepthPrepassFramebuffers;
     std::vector<VkFramebuffer> LightingFramebuffers;
+    std::vector<VkFramebuffer> CompositeFramebuffers;
     std::vector<VkFramebuffer> ParticleFramebuffers;
     std::vector<VkFramebuffer> PresentFramebuffers;
     std::vector<VkFramebuffer> EditorFramebuffers;
     std::vector<GPUTexture> SceneColors;
+    std::vector<GPUTexture> SceneResults;
     std::vector<GPUTexture> GBufferAlbedo;
     std::vector<GPUTexture> GBufferNormal;
     std::vector<GPUTexture> GBufferPosition;
     std::vector<GPUTexture> BloomPyramids;
+    std::vector<std::array<VkImageView, MaxBloomMips>> BloomMipViews;
     std::vector<GPUTexture> EditorColors;
     std::vector<VkDescriptorSet> EditorDescriptors;
     uint32_t BloomMipCount = 1;
+    VkDescriptorSetLayout BloomDescriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool BloomDescriptorPool = VK_NULL_HANDLE;
+    VkPipelineLayout BloomPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline BloomDownsamplePipeline = VK_NULL_HANDLE;
+    VkPipeline BloomUpsamplePipeline = VK_NULL_HANDLE;
+    std::vector<std::array<VkDescriptorSet, MaxBloomMips>> BloomDownDescriptors;
+    std::vector<std::array<VkDescriptorSet, MaxBloomMips>> BloomUpDescriptors;
     std::vector<GPUBuffer> TileGrids;
     std::vector<GPUBuffer> TileIndices;
     std::vector<DepthAttachment> DepthAttachments;
@@ -253,6 +278,7 @@ namespace
     VkRenderPass RenderPass = VK_NULL_HANDLE;
     VkRenderPass DepthPrepassRenderPass = VK_NULL_HANDLE;
     VkRenderPass LightingRenderPass = VK_NULL_HANDLE;
+    VkRenderPass CompositeRenderPass = VK_NULL_HANDLE;
     VkRenderPass ParticleRenderPass = VK_NULL_HANDLE;
     VkRenderPass PresentRenderPass = VK_NULL_HANDLE;
     VkRenderPass EditorRenderPass = VK_NULL_HANDLE;
@@ -305,12 +331,15 @@ namespace
     VkSampler PostSampler = VK_NULL_HANDLE;
     VkPipelineLayout PostPipelineLayout = VK_NULL_HANDLE;
     VkPipeline PostPipeline = VK_NULL_HANDLE;
+    VkPipeline CompositePipeline = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSet> CompositeDescriptors;
     GPUBuffer PostVertices;
     std::vector<VkDescriptorSet> PostDescriptors;
     VkDescriptorSetLayout LightingDescriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool LightingDescriptorPool = VK_NULL_HANDLE;
     VkPipelineLayout LightingPipelineLayout = VK_NULL_HANDLE;
     VkPipeline LightingPipeline = VK_NULL_HANDLE;
+    VkPipeline SkyboxPipeline = VK_NULL_HANDLE;
     std::vector<std::array<VkDescriptorSet, FramesInFlight>> LightingDescriptors;
     VkDescriptorSetLayout TileDescriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool TileDescriptorPool = VK_NULL_HANDLE;
@@ -322,6 +351,7 @@ namespace
     RenderEffectSettings CurrentEffects{};
     glm::vec4 ClearColor{0.008f, 0.012f, 0.025f, 1.0f};
     std::array<ShadowAttachment, FramesInFlight> Shadows{};
+    GPUBuffer ShadowOffsets;
     std::array<GPUBuffer, FramesInFlight> SceneFrames{};
     uint32_t ShadowSize = 0;
     VkFormat DepthFormat = VK_FORMAT_UNDEFINED;
@@ -343,12 +373,14 @@ namespace
     uint32_t RequestedHeight = 0;
     bool VSync = false;
     bool SwapchainDirty = false;
+    bool SceneResetPending = false;
     bool FrameStarted = false;
     bool RenderPassActive = false;
     bool DepthPrepared = false;
     bool ParticlePassActive = false;
     bool PresentPassActive = false;
     bool RenderForEditor = false;
+    bool ScreenUIOnly = false;
     bool SceneInitialized = false;
     bool ImGuiInitialized = false;
     bool ImGuiFrameActive = false;
@@ -357,8 +389,30 @@ namespace
     bool Initialized = false;
   } s_Data;
 
+  class ScopedProfile
+  {
+  public:
+    explicit ScopedProfile(const char* name) : Scope(gabprofiler_begin(name)) {}
+    ~ScopedProfile() { gabprofiler_end(&Scope); }
+    ScopedProfile(const ScopedProfile&) = delete;
+    ScopedProfile& operator=(const ScopedProfile&) = delete;
+
+  private:
+    GABProfilerScope Scope{};
+  };
+
+  VkCommandBuffer ProfilerCommandBuffer(void*, uint32_t, uint64_t)
+  {
+    if (!s_Data.FrameStarted || s_Data.Frame >= s_Data.CommandBuffers.size())
+      return VK_NULL_HANDLE;
+    return s_Data.CommandBuffers[s_Data.Frame];
+  }
+
   bool PrepareGPUCull(bool useHiZ, const glm::mat4& viewProjection,
                       bool includePreviews);
+  void BuildBloomPyramid();
+  void DrawComposite();
+  void ResetSceneResourcesNow();
 
   void Check(const VkResult result, const char* operation)
   {
@@ -1067,14 +1121,14 @@ namespace
     GPUTexture result;
     VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     image.imageType = VK_IMAGE_TYPE_2D;
-    image.extent = {s_Data.Extent.width, s_Data.Extent.height, 1};
+    image.extent = {std::max(1u, s_Data.Extent.width / 2),
+                    std::max(1u, s_Data.Extent.height / 2), 1};
     image.mipLevels = s_Data.BloomMipCount;
     image.arrayLayers = 1;
     image.format = SceneColorFormat;
     image.tiling = VK_IMAGE_TILING_OPTIMAL;
     image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    image.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                  VK_IMAGE_USAGE_SAMPLED_BIT;
+    image.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
     image.samples = VK_SAMPLE_COUNT_1_BIT;
     image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     Check(vkCreateImage(s_Data.Device, &image, nullptr, &result.Image),
@@ -1556,12 +1610,33 @@ namespace
       DestroyTexture(shadow.Texture);
       shadow = {};
     }
+    DestroyBuffer(s_Data.ShadowOffsets);
     s_Data.ShadowSize = 0;
   }
 
   void CreateShadowAttachments(const uint32_t size)
   {
     DestroyShadowAttachments();
+    const uint32_t filterSize = size >= 4096 ? 4u : (size >= 2048 ? 3u : 2u);
+    std::default_random_engine generator;
+    std::uniform_real_distribution<float> jitter(-0.5f, 0.5f);
+    std::vector<glm::vec2> offsets;
+    offsets.reserve(16u * 16u * filterSize * filterSize);
+    for (uint32_t tileY = 0; tileY < 16; ++tileY)
+      for (uint32_t tileX = 0; tileX < 16; ++tileX)
+        for (int v = static_cast<int>(filterSize) - 1; v >= 0; --v)
+          for (uint32_t u = 0; u < filterSize; ++u)
+          {
+            const float x = (static_cast<float>(u) + 0.5f + jitter(generator)) /
+                            static_cast<float>(filterSize);
+            const float y = (static_cast<float>(v) + 0.5f + jitter(generator)) /
+                            static_cast<float>(filterSize);
+            offsets.emplace_back(std::sqrt(y) * std::cos(glm::two_pi<float>() * x),
+                                 std::sqrt(y) * std::sin(glm::two_pi<float>() * x));
+          }
+    s_Data.ShadowOffsets = CreateUploadBuffer(
+      offsets.data(), offsets.size() * sizeof(glm::vec2),
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     for (ShadowAttachment& shadow : s_Data.Shadows)
     {
       VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1713,29 +1788,48 @@ namespace
 
   void CreatePointShadowRenderPass()
   {
+    VkAttachmentDescription distance{};
+    distance.format = VK_FORMAT_R32_SFLOAT;
+    distance.samples = VK_SAMPLE_COUNT_1_BIT;
+    distance.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    distance.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    distance.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    distance.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    distance.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    distance.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkAttachmentDescription depth{};
     depth.format = s_Data.DepthFormat;
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    VkAttachmentReference depthReference{0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference distanceReference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depthReference{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &distanceReference;
     subpass.pDepthStencilAttachment = &depthReference;
     const std::array<VkSubpassDependency, 2> dependencies{{
       {VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, VK_ACCESS_SHADER_READ_BIT,
-       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_DEPENDENCY_BY_REGION_BIT},
-      {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+       VK_ACCESS_SHADER_READ_BIT,
+       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_DEPENDENCY_BY_REGION_BIT},
+      {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
        VK_ACCESS_SHADER_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT}}};
+    const std::array attachments{distance, depth};
     VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    info.attachmentCount = 1;
-    info.pAttachments = &depth;
+    info.attachmentCount = static_cast<uint32_t>(attachments.size());
+    info.pAttachments = attachments.data();
     info.subpassCount = 1;
     info.pSubpasses = &subpass;
     info.dependencyCount = static_cast<uint32_t>(dependencies.size());
@@ -1748,6 +1842,7 @@ namespace
   void DestroyPointShadowAttachments()
   {
     for (PointShadowFrame& frame : s_Data.PointShadows)
+    {
       for (PointShadowCube& cube : frame.Cubes)
       {
         for (VkFramebuffer& framebuffer : cube.Framebuffers)
@@ -1762,6 +1857,8 @@ namespace
         }
         DestroyTexture(cube.Texture);
       }
+      DestroyDepthAttachment(frame.Depth);
+    }
     for (auto& frameCache : s_Data.PointShadowCache)
       for (PointShadowCacheEntry& cache : frameCache) cache = {};
     s_Data.PointShadowSize = 0;
@@ -1773,6 +1870,39 @@ namespace
     std::vector<VkImageMemoryBarrier> barriers;
     barriers.reserve(FramesInFlight * MaxPointShadowLights);
     for (PointShadowFrame& frame : s_Data.PointShadows)
+    {
+      VkImageCreateInfo depthImage{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+      depthImage.imageType = VK_IMAGE_TYPE_2D;
+      depthImage.extent = {size, size, 1};
+      depthImage.mipLevels = 1;
+      depthImage.arrayLayers = 1;
+      depthImage.format = s_Data.DepthFormat;
+      depthImage.tiling = VK_IMAGE_TILING_OPTIMAL;
+      depthImage.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      depthImage.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      depthImage.samples = VK_SAMPLE_COUNT_1_BIT;
+      depthImage.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      Check(vkCreateImage(s_Data.Device, &depthImage, nullptr, &frame.Depth.Image),
+            "vkCreateImage (point shadow depth)");
+      VkMemoryRequirements depthRequirements{};
+      vkGetImageMemoryRequirements(s_Data.Device, frame.Depth.Image, &depthRequirements);
+      VkMemoryAllocateInfo depthAllocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+      depthAllocation.allocationSize = depthRequirements.size;
+      depthAllocation.memoryTypeIndex = FindMemoryType(
+        depthRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      Check(vkAllocateMemory(s_Data.Device, &depthAllocation, nullptr, &frame.Depth.Memory),
+            "vkAllocateMemory (point shadow depth)");
+      Check(vkBindImageMemory(s_Data.Device, frame.Depth.Image, frame.Depth.Memory, 0),
+            "vkBindImageMemory (point shadow depth)");
+      VkImageViewCreateInfo depthView{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+      depthView.image = frame.Depth.Image;
+      depthView.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      depthView.format = s_Data.DepthFormat;
+      depthView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      depthView.subresourceRange.levelCount = 1;
+      depthView.subresourceRange.layerCount = 1;
+      Check(vkCreateImageView(s_Data.Device, &depthView, nullptr, &frame.Depth.View),
+            "vkCreateImageView (point shadow depth)");
       for (PointShadowCube& cube : frame.Cubes)
       {
         VkImageCreateInfo image{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1781,10 +1911,10 @@ namespace
         image.extent = {size, size, 1};
         image.mipLevels = 1;
         image.arrayLayers = 6;
-        image.format = s_Data.DepthFormat;
+        image.format = VK_FORMAT_R32_SFLOAT;
         image.tiling = VK_IMAGE_TILING_OPTIMAL;
         image.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        image.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         image.samples = VK_SAMPLE_COUNT_1_BIT;
         image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         Check(vkCreateImage(s_Data.Device, &image, nullptr, &cube.Texture.Image),
@@ -1802,8 +1932,8 @@ namespace
         VkImageViewCreateInfo cubeView{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         cubeView.image = cube.Texture.Image;
         cubeView.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
-        cubeView.format = s_Data.DepthFormat;
-        cubeView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        cubeView.format = VK_FORMAT_R32_SFLOAT;
+        cubeView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         cubeView.subresourceRange.levelCount = 1;
         cubeView.subresourceRange.layerCount = 6;
         Check(vkCreateImageView(s_Data.Device, &cubeView, nullptr, &cube.Texture.View),
@@ -1819,8 +1949,9 @@ namespace
                 "vkCreateImageView (point shadow face)");
           VkFramebufferCreateInfo framebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
           framebuffer.renderPass = s_Data.PointShadowRenderPass;
-          framebuffer.attachmentCount = 1;
-          framebuffer.pAttachments = &cube.FaceViews[face];
+          const std::array attachments{cube.FaceViews[face], frame.Depth.View};
+          framebuffer.attachmentCount = static_cast<uint32_t>(attachments.size());
+          framebuffer.pAttachments = attachments.data();
           framebuffer.width = size;
           framebuffer.height = size;
           framebuffer.layers = 1;
@@ -1830,16 +1961,17 @@ namespace
         }
         VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = cube.Texture.Image;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         barrier.subresourceRange.levelCount = 1;
         barrier.subresourceRange.layerCount = 6;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         barriers.push_back(barrier);
       }
+    }
     const VkCommandBuffer command = BeginImmediateCommands();
     vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
@@ -1854,12 +1986,15 @@ namespace
     if (!std::filesystem::exists(shaderPath)) shaderPath = "res/shaders/vulkan_shadow.slang";
     const VkShaderModule vertex = CreateShaderModule(
       Shader::CompileSlangSPIRV(shaderPath, "VSMain", "vertex"));
+    const VkShaderModule fragment = CreateShaderModule(
+      Shader::CompileSlangSPIRV(shaderPath, "PointPSMain", "fragment"));
     try
     {
-      VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-      stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-      stage.module = vertex;
-      stage.pName = "main";
+      const std::array stages{
+        VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertex, "main", nullptr},
+        VkPipelineShaderStageCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", nullptr}};
       const VkVertexInputBindingDescription binding{0, sizeof(Vertex), VK_VERTEX_INPUT_RATE_VERTEX};
       const std::array<VkVertexInputAttributeDescription, 3> attributes{{
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, static_cast<uint32_t>(offsetof(Vertex, Position))},
@@ -1887,12 +2022,19 @@ namespace
       depth.depthTestEnable = VK_TRUE;
       depth.depthWriteEnable = VK_TRUE;
       depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+      VkPipelineColorBlendAttachmentState colorBlend{};
+      colorBlend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+      VkPipelineColorBlendStateCreateInfo blending{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+      blending.attachmentCount = 1;
+      blending.pAttachments = &colorBlend;
       constexpr std::array dynamicStates{
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS};
       VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
       dynamic.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
       dynamic.pDynamicStates = dynamicStates.data();
-      VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ScenePushConstants)};
+      VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(ScenePushConstants)};
       VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
       layout.setLayoutCount = 1;
       layout.pSetLayouts = &s_Data.SceneDescriptorSetLayout;
@@ -1902,14 +2044,15 @@ namespace
                                    &s_Data.PointShadowPipelineLayout),
             "vkCreatePipelineLayout (point shadow)");
       VkGraphicsPipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-      pipeline.stageCount = 1;
-      pipeline.pStages = &stage;
+      pipeline.stageCount = static_cast<uint32_t>(stages.size());
+      pipeline.pStages = stages.data();
       pipeline.pVertexInputState = &vertexInput;
       pipeline.pInputAssemblyState = &assembly;
       pipeline.pViewportState = &viewport;
       pipeline.pRasterizationState = &raster;
       pipeline.pMultisampleState = &multisample;
       pipeline.pDepthStencilState = &depth;
+      pipeline.pColorBlendState = &blending;
       pipeline.pDynamicState = &dynamic;
       pipeline.layout = s_Data.PointShadowPipelineLayout;
       pipeline.renderPass = s_Data.PointShadowRenderPass;
@@ -1919,9 +2062,11 @@ namespace
     }
     catch (...)
     {
+      vkDestroyShaderModule(s_Data.Device, fragment, nullptr);
       vkDestroyShaderModule(s_Data.Device, vertex, nullptr);
       throw;
     }
+    vkDestroyShaderModule(s_Data.Device, fragment, nullptr);
     vkDestroyShaderModule(s_Data.Device, vertex, nullptr);
   }
 
@@ -2133,32 +2278,47 @@ namespace
   {
     if (!s_Data.PostDescriptorPool) return;
     s_Data.PostDescriptors.assign(s_Data.SceneColors.size(), VK_NULL_HANDLE);
+    s_Data.CompositeDescriptors.assign(s_Data.SceneColors.size(), VK_NULL_HANDLE);
     std::vector<VkDescriptorSetLayout> layouts(
-      s_Data.PostDescriptors.size(), s_Data.PostDescriptorSetLayout);
+      s_Data.PostDescriptors.size() * 2, s_Data.PostDescriptorSetLayout);
+    std::vector<VkDescriptorSet> descriptors(layouts.size(), VK_NULL_HANDLE);
     VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocation.descriptorPool = s_Data.PostDescriptorPool;
     allocation.descriptorSetCount = static_cast<uint32_t>(layouts.size());
     allocation.pSetLayouts = layouts.data();
-    Check(vkAllocateDescriptorSets(s_Data.Device, &allocation,
-                                   s_Data.PostDescriptors.data()),
+    Check(vkAllocateDescriptorSets(s_Data.Device, &allocation, descriptors.data()),
           "vkAllocateDescriptorSets (post)");
     for (size_t index = 0; index < s_Data.PostDescriptors.size(); ++index)
     {
-      VkDescriptorImageInfo image{};
-      image.imageView = s_Data.SceneColors[index].View;
-      image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      s_Data.CompositeDescriptors[index] = descriptors[index * 2];
+      s_Data.PostDescriptors[index] = descriptors[index * 2 + 1];
+      VkDescriptorImageInfo scene{};
+      scene.imageView = s_Data.SceneColors[index].View;
+      scene.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      VkDescriptorImageInfo result{};
+      result.imageView = s_Data.SceneResults[index].View;
+      result.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       VkDescriptorImageInfo sampler{};
       sampler.sampler = s_Data.PostSampler;
       VkDescriptorImageInfo bloom{};
       bloom.imageView = s_Data.BloomPyramids[index].View;
       bloom.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      const std::array<VkWriteDescriptorSet, 3> writes{{
+      VkDescriptorImageInfo fallback{};
+      fallback.imageView = s_Data.BlackTexture.View;
+      fallback.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      const std::array<VkWriteDescriptorSet, 6> writes{{
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_Data.CompositeDescriptors[index],
+         0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &scene, nullptr, nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_Data.CompositeDescriptors[index],
+         1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &sampler, nullptr, nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_Data.CompositeDescriptors[index],
+         2, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &bloom, nullptr, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_Data.PostDescriptors[index],
-         0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &image, nullptr, nullptr},
+         0, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &result, nullptr, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_Data.PostDescriptors[index],
          1, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLER, &sampler, nullptr, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s_Data.PostDescriptors[index],
-         2, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &bloom, nullptr, nullptr}}};
+         2, 0, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &fallback, nullptr, nullptr}}};
       vkUpdateDescriptorSets(s_Data.Device, static_cast<uint32_t>(writes.size()),
                              writes.data(), 0, nullptr);
     }
@@ -2179,10 +2339,10 @@ namespace
           "vkCreateDescriptorSetLayout (post)");
     const uint32_t imageCount = static_cast<uint32_t>(s_Data.Images.size());
     const std::array<VkDescriptorPoolSize, 2> sizes{{
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, std::max(imageCount * 2, 16u)},
-      {VK_DESCRIPTOR_TYPE_SAMPLER, std::max(imageCount, 8u)}}};
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, std::max(imageCount * 4, 16u)},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, std::max(imageCount * 2, 8u)}}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool.maxSets = std::max(imageCount, 8u);
+    pool.maxSets = std::max(imageCount * 2, 8u);
     pool.poolSizeCount = static_cast<uint32_t>(sizes.size());
     pool.pPoolSizes = sizes.data();
     Check(vkCreateDescriptorPool(s_Data.Device, &pool, nullptr, &s_Data.PostDescriptorPool),
@@ -2205,6 +2365,13 @@ namespace
       Shader::CompileSlangSPIRV(shaderPath, "VSMain", "vertex"));
     const VkShaderModule fragment = CreateShaderModule(
       Shader::CompileSlangSPIRV(shaderPath, "PSMain", "fragment"));
+    std::filesystem::path compositePath = "../res/shaders/vulkan_composite.slang";
+    if (!std::filesystem::exists(compositePath))
+      compositePath = "res/shaders/vulkan_composite.slang";
+    const VkShaderModule compositeVertex = CreateShaderModule(
+      Shader::CompileSlangSPIRV(compositePath, "VSMain", "vertex"));
+    const VkShaderModule compositeFragment = CreateShaderModule(
+      Shader::CompileSlangSPIRV(compositePath, "PSMain", "fragment"));
     try
     {
       const VkPipelineShaderStageCreateInfo stages[]{
@@ -2237,6 +2404,10 @@ namespace
       VkPipelineMultisampleStateCreateInfo multisample{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
       multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+      VkPipelineDepthStencilStateCreateInfo depth{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+      depth.depthTestEnable = VK_FALSE;
+      depth.depthWriteEnable = VK_FALSE;
       VkPipelineColorBlendAttachmentState blend{};
       blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -2265,6 +2436,7 @@ namespace
       pipeline.pViewportState = &viewport;
       pipeline.pRasterizationState = &raster;
       pipeline.pMultisampleState = &multisample;
+      pipeline.pDepthStencilState = &depth;
       pipeline.pColorBlendState = &blending;
       pipeline.pDynamicState = &dynamic;
       pipeline.layout = s_Data.PostPipelineLayout;
@@ -2272,15 +2444,154 @@ namespace
       Check(vkCreateGraphicsPipelines(s_Data.Device, VK_NULL_HANDLE, 1, &pipeline,
                                       nullptr, &s_Data.PostPipeline),
             "vkCreateGraphicsPipelines (post)");
+      const VkPipelineShaderStageCreateInfo compositeStages[]{
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_VERTEX_BIT, compositeVertex, "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_FRAGMENT_BIT, compositeFragment, "main", nullptr}};
+      pipeline.pStages = compositeStages;
+      pipeline.renderPass = s_Data.CompositeRenderPass;
+      Check(vkCreateGraphicsPipelines(s_Data.Device, VK_NULL_HANDLE, 1, &pipeline,
+                                      nullptr, &s_Data.CompositePipeline),
+            "vkCreateGraphicsPipelines (composite)");
     }
     catch (...)
     {
+      vkDestroyShaderModule(s_Data.Device, compositeFragment, nullptr);
+      vkDestroyShaderModule(s_Data.Device, compositeVertex, nullptr);
       vkDestroyShaderModule(s_Data.Device, fragment, nullptr);
       vkDestroyShaderModule(s_Data.Device, vertex, nullptr);
       throw;
     }
+    vkDestroyShaderModule(s_Data.Device, compositeFragment, nullptr);
+    vkDestroyShaderModule(s_Data.Device, compositeVertex, nullptr);
     vkDestroyShaderModule(s_Data.Device, fragment, nullptr);
     vkDestroyShaderModule(s_Data.Device, vertex, nullptr);
+  }
+
+  void AllocateBloomDescriptors()
+  {
+    if (!s_Data.BloomDescriptorPool) return;
+    s_Data.BloomDownDescriptors.assign(s_Data.BloomPyramids.size(), {});
+    s_Data.BloomUpDescriptors.assign(s_Data.BloomPyramids.size(), {});
+    for (size_t imageIndex = 0; imageIndex < s_Data.BloomPyramids.size(); ++imageIndex)
+      for (uint32_t mip = 0; mip < s_Data.BloomMipCount; ++mip)
+      {
+        const std::array<VkDescriptorSetLayout, 2> layouts{
+          s_Data.BloomDescriptorSetLayout, s_Data.BloomDescriptorSetLayout};
+        std::array<VkDescriptorSet, 2> descriptors{};
+        VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocation.descriptorPool = s_Data.BloomDescriptorPool;
+        allocation.descriptorSetCount = static_cast<uint32_t>(layouts.size());
+        allocation.pSetLayouts = layouts.data();
+        Check(vkAllocateDescriptorSets(s_Data.Device, &allocation, descriptors.data()),
+              "vkAllocateDescriptorSets (bloom)");
+        s_Data.BloomDownDescriptors[imageIndex][mip] = descriptors[0];
+        s_Data.BloomUpDescriptors[imageIndex][mip] = descriptors[1];
+
+        VkDescriptorImageInfo downSource{};
+        downSource.imageView = mip == 0
+          ? s_Data.SceneColors[imageIndex].View
+          : s_Data.BloomMipViews[imageIndex][mip - 1];
+        downSource.imageLayout = mip == 0
+          ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo upSource{};
+        upSource.imageView = s_Data.BloomMipViews[imageIndex][mip];
+        upSource.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo sampler{};
+        sampler.sampler = s_Data.PostSampler;
+        VkDescriptorImageInfo downTarget{};
+        downTarget.imageView = s_Data.BloomMipViews[imageIndex][mip];
+        downTarget.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo upTarget{};
+        upTarget.imageView = s_Data.BloomMipViews[imageIndex][mip > 0 ? mip - 1 : 0];
+        upTarget.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        const std::array<VkWriteDescriptorSet, 6> writes{{
+          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[0], 0, 0, 1,
+           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &downSource, nullptr, nullptr},
+          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[0], 1, 0, 1,
+           VK_DESCRIPTOR_TYPE_SAMPLER, &sampler, nullptr, nullptr},
+          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[0], 2, 0, 1,
+           VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &downTarget, nullptr, nullptr},
+          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[1], 0, 0, 1,
+           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &upSource, nullptr, nullptr},
+          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[1], 1, 0, 1,
+           VK_DESCRIPTOR_TYPE_SAMPLER, &sampler, nullptr, nullptr},
+          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptors[1], 2, 0, 1,
+           VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &upTarget, nullptr, nullptr}}};
+        vkUpdateDescriptorSets(s_Data.Device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
+      }
+  }
+
+  void CreateBloomPipeline()
+  {
+    const std::array<VkDescriptorSetLayoutBinding, 3> bindings{{
+      {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+      {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}}};
+    VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout.bindingCount = static_cast<uint32_t>(bindings.size());
+    layout.pBindings = bindings.data();
+    Check(vkCreateDescriptorSetLayout(s_Data.Device, &layout, nullptr,
+                                      &s_Data.BloomDescriptorSetLayout),
+          "vkCreateDescriptorSetLayout (bloom)");
+    const uint32_t maxSets = std::max(
+      16u, static_cast<uint32_t>(s_Data.Images.size()) * MaxBloomMips * 2u);
+    const std::array<VkDescriptorPoolSize, 3> sizes{{
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, maxSets},
+      {VK_DESCRIPTOR_TYPE_SAMPLER, maxSets},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxSets}}};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = maxSets;
+    pool.poolSizeCount = static_cast<uint32_t>(sizes.size());
+    pool.pPoolSizes = sizes.data();
+    Check(vkCreateDescriptorPool(s_Data.Device, &pool, nullptr,
+                                 &s_Data.BloomDescriptorPool),
+          "vkCreateDescriptorPool (bloom)");
+    AllocateBloomDescriptors();
+
+    std::filesystem::path shaderPath = "../res/shaders/vulkan_bloom.slang";
+    if (!std::filesystem::exists(shaderPath)) shaderPath = "res/shaders/vulkan_bloom.slang";
+    const VkShaderModule downsample = CreateShaderModule(
+      Shader::CompileSlangSPIRV(shaderPath, "DownsampleCS", "compute"));
+    const VkShaderModule upsample = CreateShaderModule(
+      Shader::CompileSlangSPIRV(shaderPath, "UpsampleCS", "compute"));
+    try
+    {
+      VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(BloomPushConstants)};
+      VkPipelineLayoutCreateInfo pipelineLayout{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      pipelineLayout.setLayoutCount = 1;
+      pipelineLayout.pSetLayouts = &s_Data.BloomDescriptorSetLayout;
+      pipelineLayout.pushConstantRangeCount = 1;
+      pipelineLayout.pPushConstantRanges = &push;
+      Check(vkCreatePipelineLayout(s_Data.Device, &pipelineLayout, nullptr,
+                                   &s_Data.BloomPipelineLayout),
+            "vkCreatePipelineLayout (bloom)");
+      VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+      pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+      pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+      pipeline.stage.pName = "main";
+      pipeline.stage.module = downsample;
+      pipeline.layout = s_Data.BloomPipelineLayout;
+      Check(vkCreateComputePipelines(s_Data.Device, VK_NULL_HANDLE, 1, &pipeline,
+                                     nullptr, &s_Data.BloomDownsamplePipeline),
+            "vkCreateComputePipelines (bloom downsample)");
+      pipeline.stage.module = upsample;
+      Check(vkCreateComputePipelines(s_Data.Device, VK_NULL_HANDLE, 1, &pipeline,
+                                     nullptr, &s_Data.BloomUpsamplePipeline),
+            "vkCreateComputePipelines (bloom upsample)");
+    }
+    catch (...)
+    {
+      vkDestroyShaderModule(s_Data.Device, upsample, nullptr);
+      vkDestroyShaderModule(s_Data.Device, downsample, nullptr);
+      throw;
+    }
+    vkDestroyShaderModule(s_Data.Device, upsample, nullptr);
+    vkDestroyShaderModule(s_Data.Device, downsample, nullptr);
   }
 
   void AllocateLightingDescriptors()
@@ -2323,7 +2634,7 @@ namespace
           pointShadowImages[shadow].imageView =
             s_Data.PointShadows[frame].Cubes[shadow].Texture.View;
           pointShadowImages[shadow].imageLayout =
-            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
         VkDescriptorImageInfo pointShadowSampler{};
         pointShadowSampler.sampler = s_Data.ShadowSampler;
@@ -2333,7 +2644,10 @@ namespace
         VkDescriptorBufferInfo tileIndices{};
         tileIndices.buffer = s_Data.TileIndices[imageIndex].Buffer;
         tileIndices.range = VK_WHOLE_SIZE;
-        std::array<VkWriteDescriptorSet, 15> writes{};
+        VkDescriptorBufferInfo shadowOffsets{};
+        shadowOffsets.buffer = s_Data.ShadowOffsets.Buffer;
+        shadowOffsets.range = VK_WHOLE_SIZE;
+        std::array<VkWriteDescriptorSet, 16> writes{};
         for (uint32_t binding = 0; binding < 3; ++binding)
         {
           writes[binding].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2363,6 +2677,8 @@ namespace
           13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileGrid, nullptr};
         writes[14] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptor,
           14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &tileIndices, nullptr};
+        writes[15] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptor,
+          15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &shadowOffsets, nullptr};
         vkUpdateDescriptorSets(s_Data.Device, static_cast<uint32_t>(writes.size()),
                                writes.data(), 0, nullptr);
       }
@@ -2370,7 +2686,7 @@ namespace
 
   void CreateLightingPipeline()
   {
-    const std::array<VkDescriptorSetLayoutBinding, 15> bindings{{
+    const std::array<VkDescriptorSetLayoutBinding, 16> bindings{{
       {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
@@ -2385,7 +2701,8 @@ namespace
       {11, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {12, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
       {13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-      {14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}}};
+      {14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+      {15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}}};
     VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     layout.bindingCount = static_cast<uint32_t>(bindings.size());
     layout.pBindings = bindings.data();
@@ -2397,7 +2714,7 @@ namespace
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MaxLightingSets * 9},
       {VK_DESCRIPTOR_TYPE_SAMPLER, MaxLightingSets * 3},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MaxLightingSets},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaxLightingSets * 2}}};
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MaxLightingSets * 3}}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.maxSets = MaxLightingSets;
     pool.poolSizeCount = static_cast<uint32_t>(sizes.size());
@@ -2483,6 +2800,92 @@ namespace
       Check(vkCreateGraphicsPipelines(s_Data.Device, VK_NULL_HANDLE, 1, &pipeline,
                                       nullptr, &s_Data.LightingPipeline),
             "vkCreateGraphicsPipelines (lighting)");
+    }
+    catch (...)
+    {
+      vkDestroyShaderModule(s_Data.Device, fragment, nullptr);
+      vkDestroyShaderModule(s_Data.Device, vertex, nullptr);
+      throw;
+    }
+    vkDestroyShaderModule(s_Data.Device, fragment, nullptr);
+    vkDestroyShaderModule(s_Data.Device, vertex, nullptr);
+  }
+
+  void CreateSkyboxPipeline()
+  {
+    std::filesystem::path shaderPath = "../res/shaders/vulkan_skybox.slang";
+    if (!std::filesystem::exists(shaderPath)) shaderPath = "res/shaders/vulkan_skybox.slang";
+    const VkShaderModule vertex = CreateShaderModule(
+      Shader::CompileSlangSPIRV(shaderPath, "VSMain", "vertex"));
+    const VkShaderModule fragment = CreateShaderModule(
+      Shader::CompileSlangSPIRV(shaderPath, "PSMain", "fragment"));
+    try
+    {
+      const VkPipelineShaderStageCreateInfo stages[]{
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_VERTEX_BIT, vertex, "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_FRAGMENT_BIT, fragment, "main", nullptr}};
+      const VkVertexInputBindingDescription binding{
+        0, sizeof(glm::vec2), VK_VERTEX_INPUT_RATE_VERTEX};
+      const VkVertexInputAttributeDescription attribute{
+        0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+      VkPipelineVertexInputStateCreateInfo vertexInput{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+      vertexInput.vertexBindingDescriptionCount = 1;
+      vertexInput.pVertexBindingDescriptions = &binding;
+      vertexInput.vertexAttributeDescriptionCount = 1;
+      vertexInput.pVertexAttributeDescriptions = &attribute;
+      VkPipelineInputAssemblyStateCreateInfo assembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+      assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      VkPipelineViewportStateCreateInfo viewport{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+      viewport.viewportCount = 1;
+      viewport.scissorCount = 1;
+      VkPipelineRasterizationStateCreateInfo raster{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+      raster.polygonMode = VK_POLYGON_MODE_FILL;
+      raster.cullMode = VK_CULL_MODE_NONE;
+      raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+      raster.lineWidth = 1.0f;
+      VkPipelineMultisampleStateCreateInfo multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+      multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+      VkPipelineDepthStencilStateCreateInfo depth{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+      depth.depthTestEnable = VK_FALSE;
+      depth.depthWriteEnable = VK_FALSE;
+      VkPipelineColorBlendAttachmentState blend{};
+      blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+      VkPipelineColorBlendStateCreateInfo blending{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+      blending.attachmentCount = 1;
+      blending.pAttachments = &blend;
+      constexpr std::array dynamicStates{
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+      VkPipelineDynamicStateCreateInfo dynamic{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+      dynamic.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+      dynamic.pDynamicStates = dynamicStates.data();
+      VkGraphicsPipelineCreateInfo pipeline{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+      pipeline.stageCount = 2;
+      pipeline.pStages = stages;
+      pipeline.pVertexInputState = &vertexInput;
+      pipeline.pInputAssemblyState = &assembly;
+      pipeline.pViewportState = &viewport;
+      pipeline.pRasterizationState = &raster;
+      pipeline.pMultisampleState = &multisample;
+      pipeline.pDepthStencilState = &depth;
+      pipeline.pColorBlendState = &blending;
+      pipeline.pDynamicState = &dynamic;
+      pipeline.layout = s_Data.LightingPipelineLayout;
+      pipeline.renderPass = s_Data.ParticleRenderPass;
+      Check(vkCreateGraphicsPipelines(s_Data.Device, VK_NULL_HANDLE, 1, &pipeline,
+                                      nullptr, &s_Data.SkyboxPipeline),
+            "vkCreateGraphicsPipelines (skybox)");
     }
     catch (...)
     {
@@ -2877,6 +3280,8 @@ namespace
       vkDestroyFramebuffer(s_Data.Device, framebuffer, nullptr);
     for (const VkFramebuffer framebuffer : s_Data.LightingFramebuffers)
       vkDestroyFramebuffer(s_Data.Device, framebuffer, nullptr);
+    for (const VkFramebuffer framebuffer : s_Data.CompositeFramebuffers)
+      vkDestroyFramebuffer(s_Data.Device, framebuffer, nullptr);
     for (const VkFramebuffer framebuffer : s_Data.ParticleFramebuffers)
       vkDestroyFramebuffer(s_Data.Device, framebuffer, nullptr);
     for (const VkFramebuffer framebuffer : s_Data.PresentFramebuffers)
@@ -2884,9 +3289,13 @@ namespace
     for (const VkFramebuffer framebuffer : s_Data.EditorFramebuffers)
       vkDestroyFramebuffer(s_Data.Device, framebuffer, nullptr);
     for (GPUTexture& color : s_Data.SceneColors) DestroyTexture(color);
+    for (GPUTexture& color : s_Data.SceneResults) DestroyTexture(color);
     for (GPUTexture& color : s_Data.GBufferAlbedo) DestroyTexture(color);
     for (GPUTexture& color : s_Data.GBufferNormal) DestroyTexture(color);
     for (GPUTexture& color : s_Data.GBufferPosition) DestroyTexture(color);
+    for (auto& mipViews : s_Data.BloomMipViews)
+      for (VkImageView& view : mipViews)
+        if (view) vkDestroyImageView(s_Data.Device, view, nullptr);
     for (GPUTexture& bloom : s_Data.BloomPyramids) DestroyTexture(bloom);
     for (GPUTexture& color : s_Data.EditorColors) DestroyTexture(color);
     for (GPUBuffer& grid : s_Data.TileGrids) DestroyBuffer(grid);
@@ -2904,14 +3313,17 @@ namespace
     s_Data.Framebuffers.clear();
     s_Data.DepthPrepassFramebuffers.clear();
     s_Data.LightingFramebuffers.clear();
+    s_Data.CompositeFramebuffers.clear();
     s_Data.ParticleFramebuffers.clear();
     s_Data.PresentFramebuffers.clear();
     s_Data.EditorFramebuffers.clear();
     s_Data.SceneColors.clear();
+    s_Data.SceneResults.clear();
     s_Data.GBufferAlbedo.clear();
     s_Data.GBufferNormal.clear();
     s_Data.GBufferPosition.clear();
     s_Data.BloomPyramids.clear();
+    s_Data.BloomMipViews.clear();
     s_Data.EditorColors.clear();
     s_Data.TileGrids.clear();
     s_Data.TileIndices.clear();
@@ -2922,6 +3334,9 @@ namespace
     s_Data.ImagesInFlight.clear();
     s_Data.RenderComplete.clear();
     s_Data.PostDescriptors.clear();
+    s_Data.CompositeDescriptors.clear();
+    s_Data.BloomDownDescriptors.clear();
+    s_Data.BloomUpDescriptors.clear();
     s_Data.LightingDescriptors.clear();
     s_Data.Swapchain = VK_NULL_HANDLE;
   }
@@ -3024,7 +3439,7 @@ namespace
     litColor.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     litColor.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     litColor.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    litColor.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    litColor.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkAttachmentReference litReference{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
     VkSubpassDescription litSubpass{};
     litSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -3050,6 +3465,34 @@ namespace
     Check(vkCreateRenderPass(s_Data.Device, &litInfo, nullptr,
                              &s_Data.LightingRenderPass),
           "vkCreateRenderPass (lighting)");
+
+    VkAttachmentDescription compositeColor = litColor;
+    compositeColor.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference compositeReference{
+      0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription compositeSubpass{};
+    compositeSubpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    compositeSubpass.colorAttachmentCount = 1;
+    compositeSubpass.pColorAttachments = &compositeReference;
+    const std::array<VkSubpassDependency, 2> compositeDependencies{{
+      {VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_SHADER_READ_BIT,
+       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_DEPENDENCY_BY_REGION_BIT},
+      {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+       VK_DEPENDENCY_BY_REGION_BIT}}};
+    VkRenderPassCreateInfo compositeInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    compositeInfo.attachmentCount = 1;
+    compositeInfo.pAttachments = &compositeColor;
+    compositeInfo.subpassCount = 1;
+    compositeInfo.pSubpasses = &compositeSubpass;
+    compositeInfo.dependencyCount = static_cast<uint32_t>(compositeDependencies.size());
+    compositeInfo.pDependencies = compositeDependencies.data();
+    Check(vkCreateRenderPass(s_Data.Device, &compositeInfo, nullptr,
+                             &s_Data.CompositeRenderPass),
+          "vkCreateRenderPass (composite)");
 
     VkAttachmentDescription particleColor = litColor;
     particleColor.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -3211,10 +3654,12 @@ namespace
     }
     s_Data.DepthAttachments.reserve(imageCount);
     s_Data.SceneColors.reserve(imageCount);
+    s_Data.SceneResults.reserve(imageCount);
     s_Data.GBufferAlbedo.reserve(imageCount);
     s_Data.GBufferNormal.reserve(imageCount);
     s_Data.GBufferPosition.reserve(imageCount);
     s_Data.BloomPyramids.reserve(imageCount);
+    s_Data.BloomMipViews.reserve(imageCount);
     s_Data.EditorColors.reserve(imageCount);
     s_Data.TileGrids.reserve(imageCount);
     s_Data.TileIndices.reserve(imageCount);
@@ -3225,10 +3670,26 @@ namespace
     {
       s_Data.DepthAttachments.push_back(CreateDepthAttachment());
       s_Data.SceneColors.push_back(CreateColorAttachment(SceneColorFormat));
+      s_Data.SceneResults.push_back(CreateColorAttachment(SceneColorFormat));
       s_Data.GBufferAlbedo.push_back(CreateColorAttachment(VK_FORMAT_R8G8B8A8_UNORM));
       s_Data.GBufferNormal.push_back(CreateColorAttachment(VK_FORMAT_R16G16B16A16_SFLOAT));
       s_Data.GBufferPosition.push_back(CreateColorAttachment(VK_FORMAT_R16G16B16A16_SFLOAT));
       s_Data.BloomPyramids.push_back(CreateBloomPyramid());
+      std::array<VkImageView, MaxBloomMips> mipViews{};
+      for (uint32_t mip = 0; mip < s_Data.BloomMipCount; ++mip)
+      {
+        VkImageViewCreateInfo mipView{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        mipView.image = s_Data.BloomPyramids.back().Image;
+        mipView.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        mipView.format = SceneColorFormat;
+        mipView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        mipView.subresourceRange.baseMipLevel = mip;
+        mipView.subresourceRange.levelCount = 1;
+        mipView.subresourceRange.layerCount = 1;
+        Check(vkCreateImageView(s_Data.Device, &mipView, nullptr, &mipViews[mip]),
+              "vkCreateImageView (bloom mip)");
+      }
+      s_Data.BloomMipViews.push_back(mipViews);
       s_Data.EditorColors.push_back(CreateColorAttachment(s_Data.SwapchainFormat));
       const uint32_t tileCount = ((s_Data.Extent.width + TileSize - 1) / TileSize) *
                                  ((s_Data.Extent.height + TileSize - 1) / TileSize);
@@ -3267,6 +3728,7 @@ namespace
     s_Data.Framebuffers.resize(imageCount);
     s_Data.DepthPrepassFramebuffers.resize(imageCount);
     s_Data.LightingFramebuffers.resize(imageCount);
+    s_Data.CompositeFramebuffers.resize(imageCount);
     s_Data.ParticleFramebuffers.resize(imageCount);
     s_Data.PresentFramebuffers.resize(imageCount);
     s_Data.EditorFramebuffers.resize(imageCount);
@@ -3304,10 +3766,16 @@ namespace
       Check(vkCreateFramebuffer(s_Data.Device, &lightingFramebuffer, nullptr,
                                 &s_Data.LightingFramebuffers[index]),
             "vkCreateFramebuffer (lighting)");
+      VkFramebufferCreateInfo compositeFramebuffer = lightingFramebuffer;
+      compositeFramebuffer.renderPass = s_Data.CompositeRenderPass;
+      compositeFramebuffer.pAttachments = &s_Data.SceneResults[index].View;
+      Check(vkCreateFramebuffer(s_Data.Device, &compositeFramebuffer, nullptr,
+                                &s_Data.CompositeFramebuffers[index]),
+            "vkCreateFramebuffer (composite)");
       VkFramebufferCreateInfo particleFramebuffer{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
       particleFramebuffer.renderPass = s_Data.ParticleRenderPass;
       const std::array particleAttachments{
-        s_Data.SceneColors[index].View, s_Data.DepthAttachments[index].View};
+        s_Data.SceneResults[index].View, s_Data.DepthAttachments[index].View};
       particleFramebuffer.attachmentCount = static_cast<uint32_t>(particleAttachments.size());
       particleFramebuffer.pAttachments = particleAttachments.data();
       particleFramebuffer.width = s_Data.Extent.width;
@@ -3358,6 +3826,9 @@ namespace
     if (s_Data.PostDescriptorPool)
       Check(vkResetDescriptorPool(s_Data.Device, s_Data.PostDescriptorPool, 0),
             "vkResetDescriptorPool (post)");
+    if (s_Data.BloomDescriptorPool)
+      Check(vkResetDescriptorPool(s_Data.Device, s_Data.BloomDescriptorPool, 0),
+            "vkResetDescriptorPool (bloom)");
     if (s_Data.LightingDescriptorPool)
       Check(vkResetDescriptorPool(s_Data.Device, s_Data.LightingDescriptorPool, 0),
             "vkResetDescriptorPool (lighting)");
@@ -3372,7 +3843,9 @@ namespace
             "vkResetDescriptorPool (Hi-Z resize)");
     DestroySwapchain();
     CreateSwapchain();
+    Camera::SetViewportSize(s_Data.Extent.width, s_Data.Extent.height);
     AllocatePostDescriptors();
+    AllocateBloomDescriptors();
     AllocateLightingDescriptors();
     AllocateTileDescriptors();
     if (s_Data.CullDescriptorPool) AllocateCullDescriptors();
@@ -3465,11 +3938,10 @@ namespace
     const glm::mat4 view = glm::lookAt(focus - direction * 180.0f, focus, lightUp);
     const glm::mat4 projection = glm::ortho(
       -orthoSize, orthoSize, -orthoSize, orthoSize, 0.1f, 400.0f);
-    glm::mat4 correction(1.0f);
-    correction[1][1] = -1.0f;
-    correction[2][2] = 0.5f;
-    correction[3][2] = 0.5f;
-    return correction * projection * view;
+    glm::mat4 depthCorrection(1.0f);
+    depthCorrection[2][2] = 0.5f;
+    depthCorrection[3][2] = 0.5f;
+    return depthCorrection * projection * view;
   }
 
   void UpdateShadowDescriptorImages()
@@ -3500,7 +3972,18 @@ namespace
         write.descriptorCount = 1;
         write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         write.pImageInfo = &image;
-        vkUpdateDescriptorSets(s_Data.Device, 1, &write, 0, nullptr);
+        VkDescriptorBufferInfo offsets{};
+        offsets.buffer = s_Data.ShadowOffsets.Buffer;
+        offsets.range = VK_WHOLE_SIZE;
+        VkWriteDescriptorSet offsetWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        offsetWrite.dstSet = descriptors[frame];
+        offsetWrite.dstBinding = 15;
+        offsetWrite.descriptorCount = 1;
+        offsetWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        offsetWrite.pBufferInfo = &offsets;
+        const std::array writes{write, offsetWrite};
+        vkUpdateDescriptorSets(s_Data.Device, static_cast<uint32_t>(writes.size()),
+                               writes.data(), 0, nullptr);
       }
   }
 
@@ -3532,7 +4015,7 @@ namespace
         for (uint32_t shadow = 0; shadow < MaxPointShadowLights; ++shadow)
         {
           images[shadow].imageView = s_Data.PointShadows[frame].Cubes[shadow].Texture.View;
-          images[shadow].imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+          images[shadow].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
           writes[shadow].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
           writes[shadow].dstSet = descriptors[frame];
           writes[shadow].dstBinding = 8 + shadow;
@@ -3605,18 +4088,8 @@ namespace
 
   glm::mat4 PointShadowViewProjection(const glm::vec3& position, const uint32_t face)
   {
-    static constexpr std::array<glm::vec3, 6> directions{{
-      {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}};
-    static constexpr std::array<glm::vec3, 6> up{{
-      {0, -1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}, {0, -1, 0}, {0, -1, 0}}};
-    const glm::mat4 projection = glm::perspective(
-      glm::half_pi<float>(), 1.0f, 0.1f, PointShadowRadius);
-    glm::mat4 correction(1.0f);
-    correction[1][1] = -1.0f;
-    correction[2][2] = 0.5f;
-    correction[3][2] = 0.5f;
-    return correction * projection * glm::lookAt(
-      position, position + directions[face], up[face]);
+    return ShadowMath::PointViewProjection(
+      position, face, 0.1f, PointShadowRadius);
   }
 
   PointShadowCasterState GetPointShadowCasterState(const glm::vec3& lightPosition)
@@ -3659,8 +4132,10 @@ namespace
     if (!s_Data.PointShadowPipeline || effects.ShadowQuality == GraphicsQuality::Off) return;
     const auto& lights = RenderBackend::Lights();
     VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
-    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(s_Data.PointShadowSize),
-                              static_cast<float>(s_Data.PointShadowSize), 0.0f, 1.0f};
+    const VkViewport viewport{
+      0.0f, static_cast<float>(s_Data.PointShadowSize),
+      static_cast<float>(s_Data.PointShadowSize),
+      -static_cast<float>(s_Data.PointShadowSize), 0.0f, 1.0f};
     const VkRect2D scissor{{0, 0}, {s_Data.PointShadowSize, s_Data.PointShadowSize}};
     for (uint32_t slot = 0; slot < MaxPointShadowLights; ++slot)
     {
@@ -3683,14 +4158,15 @@ namespace
         const glm::mat4 lightViewProjection = PointShadowViewProjection(
           lights[lightIndex].Position, face);
         const bool gpuCulled = PrepareGPUCull(false, lightViewProjection, false);
-        VkClearValue clear{};
-        clear.depthStencil = {1.0f, 0};
+        std::array<VkClearValue, 2> clear{};
+        clear[0].color.float32[0] = PointShadowRadius;
+        clear[1].depthStencil = {1.0f, 0};
         VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         begin.renderPass = s_Data.PointShadowRenderPass;
         begin.framebuffer = s_Data.PointShadows[s_Data.Frame].Cubes[slot].Framebuffers[face];
         begin.renderArea.extent = {s_Data.PointShadowSize, s_Data.PointShadowSize};
-        begin.clearValueCount = 1;
-        begin.pClearValues = &clear;
+        begin.clearValueCount = static_cast<uint32_t>(clear.size());
+        begin.pClearValues = clear.data();
         vkCmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdSetViewport(command, 0, 1, &viewport);
         vkCmdSetScissor(command, 0, 1, &scissor);
@@ -3703,9 +4179,11 @@ namespace
           {
             const ScenePushConstants constants{
               lightViewProjection,
-              glm::vec4(1.0f, static_cast<float>(record.TransformOffset), 0.0f, 0.0f)};
+              glm::vec4(1.0f, static_cast<float>(record.TransformOffset), 0.0f, 0.0f),
+              glm::vec4(lights[lightIndex].Position, 1.0f)};
             vkCmdPushConstants(command, s_Data.PointShadowPipelineLayout,
-                               VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(constants), &constants);
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(constants), &constants);
             const VkDeviceSize offset = 0;
             vkCmdBindVertexBuffers(command, 0, 1, &record.Mesh->Vertices.Buffer, &offset);
             vkCmdBindIndexBuffer(command, record.Mesh->Indices.Buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -3768,7 +4246,9 @@ namespace
     data.TileInfo = glm::vec4(
       static_cast<float>((s_Data.Extent.width + TileSize - 1) / TileSize),
       s_Data.TilePipeline ? 1.0f : 0.0f,
-      static_cast<float>(RenderBackend::DebugSettings().TiledLightingMode), 0.0f);
+      static_cast<float>(RenderBackend::DebugSettings().TiledLightingMode),
+      effects.ShadowQuality == GraphicsQuality::High ? 4.0f :
+        (effects.ShadowQuality == GraphicsQuality::Medium ? 3.0f : 2.0f));
     data.ViewportInfo = glm::vec4(
       static_cast<float>(s_Data.Extent.width), static_cast<float>(s_Data.Extent.height),
       1.0f / static_cast<float>(std::max(s_Data.Extent.width, 1u)),
@@ -3798,8 +4278,10 @@ namespace
     begin.clearValueCount = 1;
     begin.pClearValues = &clear;
     vkCmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(s_Data.ShadowSize),
-                              static_cast<float>(s_Data.ShadowSize), 0.0f, 1.0f};
+    const VkViewport viewport{
+      0.0f, static_cast<float>(s_Data.ShadowSize),
+      static_cast<float>(s_Data.ShadowSize),
+      -static_cast<float>(s_Data.ShadowSize), 0.0f, 1.0f};
     const VkRect2D scissor{{0, 0}, {s_Data.ShadowSize, s_Data.ShadowSize}};
     vkCmdSetViewport(command, 0, 1, &viewport);
     vkCmdSetScissor(command, 0, 1, &scissor);
@@ -3871,7 +4353,8 @@ namespace
         outputTransformCount += model->m_InstanceTransforms.size();
       }
     }
-    if (includePreviews)
+    // Every cull dispatch in this command buffer must read the same upload data.
+    // Shadow passes keep preview draws at zero instances via the push-constant flag.
     for (const RenderModelPreview& preview : s_Data.ModelPreviews)
     {
       const auto model = ModelManager::GetModel(preview.ModelName);
@@ -3958,9 +4441,20 @@ namespace
     CullPushConstants constants;
     constants.ViewProjection = viewProjection;
     constants.Params.x = static_cast<uint32_t>(inputs.size());
-    constants.Params.y = useHiZ && s_Data.HiZ[s_Data.Frame].Valid ? 1u : 0u;
+    constants.Params.y =
+      (useHiZ && s_Data.HiZ[s_Data.Frame].Valid ? 1u : 0u) |
+      (includePreviews ? 2u : 0u);
     constants.Params.z = s_Data.Extent.width;
     constants.Params.w = s_Data.Extent.height;
+    if (s_Data.CurrentEffects.PS1Enabled)
+    {
+      const float virtualHeight = std::max(s_Data.CurrentEffects.PS1VirtualHeight, 1.0f);
+      const float virtualWidth = std::max(std::round(
+        virtualHeight * static_cast<float>(s_Data.Extent.width) /
+        static_cast<float>(std::max(s_Data.Extent.height, 1u))), 1.0f);
+      constants.SnapMargin = glm::vec4(
+        1.0f / virtualWidth, 1.0f / virtualHeight, 0.0f, 0.0f);
+    }
     vkCmdPushConstants(command, s_Data.CullPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(constants), &constants);
     vkCmdDispatch(command, (constants.Params.x + 63) / 64, 1, 1);
@@ -4174,163 +4668,209 @@ namespace
       vkCmdEndRenderPass(command);
       s_Data.RenderPassActive = false;
     }
-    DispatchTileLights();
-
-    VkClearValue clear{};
-    clear.color = {{s_Data.ClearColor.r, s_Data.ClearColor.g,
-                    s_Data.ClearColor.b, s_Data.ClearColor.a}};
-    VkRenderPassBeginInfo lighting{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    lighting.renderPass = s_Data.LightingRenderPass;
-    lighting.framebuffer = s_Data.LightingFramebuffers[s_Data.ImageIndex];
-    lighting.renderArea.extent = s_Data.Extent;
-    lighting.clearValueCount = 1;
-    lighting.pClearValues = &clear;
-    vkCmdBeginRenderPass(command, &lighting, VK_SUBPASS_CONTENTS_INLINE);
-    if (s_Data.LightingPipeline &&
-        s_Data.ImageIndex < s_Data.LightingDescriptors.size())
+    if (!s_Data.ScreenUIOnly)
     {
-      const VkViewport viewport{0.0f, 0.0f, static_cast<float>(s_Data.Extent.width),
-                                static_cast<float>(s_Data.Extent.height), 0.0f, 1.0f};
-      const VkRect2D scissor{{0, 0}, s_Data.Extent};
-      vkCmdSetViewport(command, 0, 1, &viewport);
-      vkCmdSetScissor(command, 0, 1, &scissor);
-      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Data.LightingPipeline);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              s_Data.LightingPipelineLayout, 0, 1,
-                              &s_Data.LightingDescriptors[s_Data.ImageIndex][s_Data.Frame],
-                              0, nullptr);
-      const VkDeviceSize offset = 0;
-      vkCmdBindVertexBuffers(command, 0, 1, &s_Data.PostVertices.Buffer, &offset);
-      vkCmdDraw(command, 3, 1, 0, 0);
+      ScopedProfile profile("TILED LIGHT CULL");
+      DispatchTileLights();
     }
-    vkCmdEndRenderPass(command);
 
-    VkRenderPassBeginInfo particles{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    particles.renderPass = s_Data.ParticleRenderPass;
-    particles.framebuffer = s_Data.ParticleFramebuffers[s_Data.ImageIndex];
-    particles.renderArea.extent = s_Data.Extent;
-    vkCmdBeginRenderPass(command, &particles, VK_SUBPASS_CONTENTS_INLINE);
+    {
+      ScopedProfile profile("LIGHT PASS");
+      VkClearValue clear{};
+      clear.color = {{s_Data.ClearColor.r, s_Data.ClearColor.g,
+                      s_Data.ClearColor.b, s_Data.ClearColor.a}};
+      VkRenderPassBeginInfo lighting{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      lighting.renderPass = s_Data.LightingRenderPass;
+      lighting.framebuffer = s_Data.LightingFramebuffers[s_Data.ImageIndex];
+      lighting.renderArea.extent = s_Data.Extent;
+      lighting.clearValueCount = 1;
+      lighting.pClearValues = &clear;
+      vkCmdBeginRenderPass(command, &lighting, VK_SUBPASS_CONTENTS_INLINE);
+      if (!s_Data.ScreenUIOnly && s_Data.LightingPipeline &&
+          s_Data.ImageIndex < s_Data.LightingDescriptors.size())
+      {
+        const VkViewport viewport{0.0f, 0.0f, static_cast<float>(s_Data.Extent.width),
+                                  static_cast<float>(s_Data.Extent.height), 0.0f, 1.0f};
+        const VkRect2D scissor{{0, 0}, s_Data.Extent};
+        vkCmdSetViewport(command, 0, 1, &viewport);
+        vkCmdSetScissor(command, 0, 1, &scissor);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Data.LightingPipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                s_Data.LightingPipelineLayout, 0, 1,
+                                &s_Data.LightingDescriptors[s_Data.ImageIndex][s_Data.Frame],
+                                0, nullptr);
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(command, 0, 1, &s_Data.PostVertices.Buffer, &offset);
+        vkCmdDraw(command, 3, 1, 0, 0);
+      }
+      vkCmdEndRenderPass(command);
+    }
+
+    {
+      ScopedProfile profile("BLOOM PASS");
+      BuildBloomPyramid();
+      VkClearValue compositeClear{};
+      compositeClear.color = {{s_Data.ClearColor.r, s_Data.ClearColor.g,
+                               s_Data.ClearColor.b, s_Data.ClearColor.a}};
+      VkRenderPassBeginInfo composite{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      composite.renderPass = s_Data.CompositeRenderPass;
+      composite.framebuffer = s_Data.CompositeFramebuffers[s_Data.ImageIndex];
+      composite.renderArea.extent = s_Data.Extent;
+      composite.clearValueCount = 1;
+      composite.pClearValues = &compositeClear;
+      vkCmdBeginRenderPass(command, &composite, VK_SUBPASS_CONTENTS_INLINE);
+      DrawComposite();
+      vkCmdEndRenderPass(command);
+    }
+
+    {
+      ScopedProfile profile("FORWARD PASS");
+      VkRenderPassBeginInfo particles{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      particles.renderPass = s_Data.ParticleRenderPass;
+      particles.framebuffer = s_Data.ParticleFramebuffers[s_Data.ImageIndex];
+      particles.renderArea.extent = s_Data.Extent;
+      vkCmdBeginRenderPass(command, &particles, VK_SUBPASS_CONTENTS_INLINE);
+      if (!s_Data.ScreenUIOnly && s_Data.SkyboxPipeline && s_Data.HasSkybox &&
+          s_Data.ImageIndex < s_Data.LightingDescriptors.size())
+      {
+        const VkViewport viewport{0.0f, 0.0f, static_cast<float>(s_Data.Extent.width),
+                                  static_cast<float>(s_Data.Extent.height), 0.0f, 1.0f};
+        const VkRect2D scissor{{0, 0}, s_Data.Extent};
+        vkCmdSetViewport(command, 0, 1, &viewport);
+        vkCmdSetScissor(command, 0, 1, &scissor);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          s_Data.SkyboxPipeline);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                s_Data.LightingPipelineLayout, 0, 1,
+                                &s_Data.LightingDescriptors[s_Data.ImageIndex][s_Data.Frame],
+                                0, nullptr);
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(command, 0, 1, &s_Data.PostVertices.Buffer, &offset);
+        vkCmdDraw(command, 3, 1, 0, 0);
+      }
+    }
     s_Data.ParticlePassActive = true;
   }
 
   void BuildBloomPyramid()
   {
     if (s_Data.CurrentEffects.BloomQuality == GraphicsQuality::Off ||
+        !s_Data.BloomDownsamplePipeline || !s_Data.BloomUpsamplePipeline ||
         s_Data.ImageIndex >= s_Data.BloomPyramids.size()) return;
     VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
     const uint32_t mipCount = std::clamp(
       s_Data.CurrentEffects.BloomPassCount(), 1u, s_Data.BloomMipCount);
-    VkImageMemoryBarrier sceneToTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    sceneToTransfer.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    sceneToTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    sceneToTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    sceneToTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    sceneToTransfer.image = s_Data.SceneColors[s_Data.ImageIndex].Image;
-    sceneToTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    sceneToTransfer.subresourceRange.levelCount = 1;
-    sceneToTransfer.subresourceRange.layerCount = 1;
-    sceneToTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
-                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    sceneToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    VkImageMemoryBarrier bloomToTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    bloomToTransfer.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    bloomToTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    bloomToTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    bloomToTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    bloomToTransfer.image = s_Data.BloomPyramids[s_Data.ImageIndex].Image;
-    bloomToTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    bloomToTransfer.subresourceRange.levelCount = 1;
-    bloomToTransfer.subresourceRange.layerCount = 1;
-    bloomToTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    bloomToTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    const std::array initialBarriers{sceneToTransfer, bloomToTransfer};
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                         static_cast<uint32_t>(initialBarriers.size()),
-                         initialBarriers.data());
-    VkImageCopy copy{};
-    copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.srcSubresource.layerCount = 1;
-    copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.dstSubresource.layerCount = 1;
-    copy.extent = {s_Data.Extent.width, s_Data.Extent.height, 1};
-    vkCmdCopyImage(command, s_Data.SceneColors[s_Data.ImageIndex].Image,
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   s_Data.BloomPyramids[s_Data.ImageIndex].Image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    VkImageMemoryBarrier bloomBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    bloomBarrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    bloomBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bloomBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bloomBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bloomBarrier.image = s_Data.BloomPyramids[s_Data.ImageIndex].Image;
+    bloomBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bloomBarrier.subresourceRange.levelCount = s_Data.BloomMipCount;
+    bloomBarrier.subresourceRange.layerCount = 1;
+    bloomBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bloomBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &bloomBarrier);
 
-    for (uint32_t mip = 1; mip < mipCount; ++mip)
+    auto computeBarrier = [&]
     {
-      VkImageMemoryBarrier barriers[2]{};
-      barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-      barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-      barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-      barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barriers[0].image = s_Data.BloomPyramids[s_Data.ImageIndex].Image;
-      barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      barriers[0].subresourceRange.baseMipLevel = mip - 1;
-      barriers[0].subresourceRange.levelCount = 1;
-      barriers[0].subresourceRange.layerCount = 1;
-      barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-      barriers[1] = bloomToTransfer;
-      barriers[1].subresourceRange.baseMipLevel = mip;
-      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT |
-                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
-                           2, barriers);
-      const int32_t sourceWidth = static_cast<int32_t>(std::max(1u, s_Data.Extent.width >> (mip - 1)));
-      const int32_t sourceHeight = static_cast<int32_t>(std::max(1u, s_Data.Extent.height >> (mip - 1)));
-      const int32_t targetWidth = static_cast<int32_t>(std::max(1u, s_Data.Extent.width >> mip));
-      const int32_t targetHeight = static_cast<int32_t>(std::max(1u, s_Data.Extent.height >> mip));
-      VkImageBlit blit{};
-      blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      blit.srcSubresource.mipLevel = mip - 1;
-      blit.srcSubresource.layerCount = 1;
-      blit.srcOffsets[1] = {sourceWidth, sourceHeight, 1};
-      blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      blit.dstSubresource.mipLevel = mip;
-      blit.dstSubresource.layerCount = 1;
-      blit.dstOffsets[1] = {targetWidth, targetHeight, 1};
-      vkCmdBlitImage(command, s_Data.BloomPyramids[s_Data.ImageIndex].Image,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     s_Data.BloomPyramids[s_Data.ImageIndex].Image,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-    }
+      VkImageMemoryBarrier barrier = bloomBarrier;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                           0, nullptr, 0, nullptr, 1, &barrier);
+    };
 
-    std::vector<VkImageMemoryBarrier> finalBarriers;
-    finalBarriers.reserve(mipCount + 1);
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      s_Data.BloomDownsamplePipeline);
     for (uint32_t mip = 0; mip < mipCount; ++mip)
     {
-      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-      barrier.oldLayout = mip + 1 < mipCount
-        ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.image = s_Data.BloomPyramids[s_Data.ImageIndex].Image;
-      barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      barrier.subresourceRange.baseMipLevel = mip;
-      barrier.subresourceRange.levelCount = 1;
-      barrier.subresourceRange.layerCount = 1;
-      barrier.srcAccessMask = mip + 1 < mipCount
-        ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
-      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-      finalBarriers.push_back(barrier);
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              s_Data.BloomPipelineLayout, 0, 1,
+                              &s_Data.BloomDownDescriptors[s_Data.ImageIndex][mip],
+                              0, nullptr);
+      const uint32_t sourceWidth = mip == 0 ? s_Data.Extent.width :
+        std::max(1u, (s_Data.Extent.width / 2) >> (mip - 1));
+      const uint32_t sourceHeight = mip == 0 ? s_Data.Extent.height :
+        std::max(1u, (s_Data.Extent.height / 2) >> (mip - 1));
+      const uint32_t targetWidth = std::max(1u, (s_Data.Extent.width / 2) >> mip);
+      const uint32_t targetHeight = std::max(1u, (s_Data.Extent.height / 2) >> mip);
+      const BloomPushConstants constants{glm::vec4(
+        static_cast<float>(sourceWidth), static_cast<float>(sourceHeight),
+        static_cast<float>(mip), s_Data.CurrentEffects.BloomThreshold)};
+      vkCmdPushConstants(command, s_Data.BloomPipelineLayout,
+                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+      vkCmdDispatch(command, (targetWidth + 7) / 8, (targetHeight + 7) / 8, 1);
+      computeBarrier();
     }
-    VkImageMemoryBarrier sceneToShader = sceneToTransfer;
-    sceneToShader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    sceneToShader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    sceneToShader.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    sceneToShader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    finalBarriers.push_back(sceneToShader);
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      s_Data.BloomUpsamplePipeline);
+    for (uint32_t mip = mipCount - 1; mip > 0; --mip)
+    {
+      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              s_Data.BloomPipelineLayout, 0, 1,
+                              &s_Data.BloomUpDescriptors[s_Data.ImageIndex][mip],
+                              0, nullptr);
+      const uint32_t targetWidth = std::max(
+        1u, (s_Data.Extent.width / 2) >> (mip - 1));
+      const uint32_t targetHeight = std::max(
+        1u, (s_Data.Extent.height / 2) >> (mip - 1));
+      const BloomPushConstants constants{glm::vec4(
+        0.0f, 0.0f, 0.0f, s_Data.CurrentEffects.BloomFilterRadius)};
+      vkCmdPushConstants(command, s_Data.BloomPipelineLayout,
+                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+      vkCmdDispatch(command, (targetWidth + 7) / 8, (targetHeight + 7) / 8, 1);
+      computeBarrier();
+    }
+
+    bloomBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bloomBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    bloomBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bloomBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
-                         0, nullptr, 0, nullptr,
-                         static_cast<uint32_t>(finalBarriers.size()),
-                         finalBarriers.data());
+                         0, nullptr, 0, nullptr, 1, &bloomBarrier);
+  }
+
+  void DrawComposite()
+  {
+    if (!s_Data.CompositePipeline ||
+        s_Data.ImageIndex >= s_Data.CompositeDescriptors.size()) return;
+    VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
+    const VkViewport viewport{0.0f, 0.0f, static_cast<float>(s_Data.Extent.width),
+                              static_cast<float>(s_Data.Extent.height), 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, s_Data.Extent};
+    vkCmdSetViewport(command, 0, 1, &viewport);
+    vkCmdSetScissor(command, 0, 1, &scissor);
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      s_Data.CompositePipeline);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            s_Data.PostPipelineLayout, 0, 1,
+                            &s_Data.CompositeDescriptors[s_Data.ImageIndex], 0, nullptr);
+    const VkDeviceSize vertexOffset = 0;
+    vkCmdBindVertexBuffers(command, 0, 1, &s_Data.PostVertices.Buffer, &vertexOffset);
+    const RenderEffectSettings& effects = s_Data.CurrentEffects;
+    const float bloomPassCount = static_cast<float>(std::min(
+      effects.BloomPassCount(), s_Data.BloomMipCount));
+    PostPushConstants constants;
+    constants.Params = glm::vec4(
+      effects.BloomQuality == GraphicsQuality::Off ? 0.0f : effects.BloomStrength,
+      effects.BloomThreshold, effects.BloomExposure, effects.Gamma);
+    constants.Effects.w = bloomPassCount;
+    constants.Resolution = glm::vec4(
+      static_cast<float>(s_Data.Extent.width), static_cast<float>(s_Data.Extent.height),
+      1.0f / static_cast<float>(std::max(s_Data.Extent.width, 1u)),
+      1.0f / static_cast<float>(std::max(s_Data.Extent.height, 1u)));
+    vkCmdPushConstants(command, s_Data.PostPipelineLayout,
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants), &constants);
+    vkCmdDraw(command, 3, 1, 0, 0);
   }
 
   void DrawPostProcess()
@@ -4349,19 +4889,14 @@ namespace
     const VkDeviceSize vertexOffset = 0;
     vkCmdBindVertexBuffers(command, 0, 1, &s_Data.PostVertices.Buffer, &vertexOffset);
     const RenderEffectSettings& effects = s_Data.CurrentEffects;
-    const float bloomPassCount = static_cast<float>(std::min(
-      effects.BloomPassCount(), s_Data.BloomMipCount));
     PostPushConstants constants;
-    constants.Params = glm::vec4(
-      effects.BloomQuality == GraphicsQuality::Off ? 0.0f : effects.BloomStrength,
-      effects.BloomThreshold, effects.BloomExposure, effects.Gamma);
     constants.Effects = glm::vec4(
       effects.PS1Enabled ? 1.0f : 0.0f, effects.PS1ColorLevels,
-      effects.PS1VirtualHeight, bloomPassCount);
+      effects.PS1VirtualHeight, 0.0f);
     constants.Resolution = glm::vec4(
       static_cast<float>(s_Data.Extent.width), static_cast<float>(s_Data.Extent.height),
-      1.0f / static_cast<float>(s_Data.Extent.width),
-      1.0f / static_cast<float>(s_Data.Extent.height));
+      1.0f / static_cast<float>(std::max(s_Data.Extent.width, 1u)),
+      1.0f / static_cast<float>(std::max(s_Data.Extent.height, 1u)));
     vkCmdPushConstants(command, s_Data.PostPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(constants), &constants);
     vkCmdDraw(command, 3, 1, 0, 0);
@@ -4370,6 +4905,7 @@ namespace
   void BeginPresentRenderPass()
   {
     if (!s_Data.FrameStarted || s_Data.PresentPassActive) return;
+    ScopedProfile profile("SCENE RESULT PASS");
     BeginParticleRenderPass();
     VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
     if (s_Data.ParticlePassActive)
@@ -4377,7 +4913,6 @@ namespace
       vkCmdEndRenderPass(command);
       s_Data.ParticlePassActive = false;
     }
-    BuildBloomPyramid();
     VkClearValue clear{};
     clear.color = {{0.008f, 0.012f, 0.025f, 1.0f}};
     if (s_Data.RenderForEditor &&
@@ -4491,6 +5026,31 @@ namespace
       }
     VulkanRenderer::EndDebugLines();
   }
+
+  void ResetSceneResourcesNow()
+  {
+    if (!s_Data.Device) return;
+    Check(vkDeviceWaitIdle(s_Data.Device), "vkDeviceWaitIdle (scene reset)");
+    for (auto& mesh : s_Data.Meshes)
+    {
+      DestroyBuffer(mesh.second.Vertices);
+      DestroyBuffer(mesh.second.Indices);
+    }
+    s_Data.Meshes.clear();
+    for (auto& model : s_Data.Models)
+      for (GPUBuffer& bones : model.second.Bones)
+        DestroyBuffer(bones);
+    s_Data.Models.clear();
+    for (auto& texture : s_Data.Textures)
+      DestroyTexture(texture.second);
+    s_Data.Textures.clear();
+    s_Data.HasSkybox = false;
+    s_Data.ModelPreviews.clear();
+    s_Data.SceneResetPending = false;
+    if (s_Data.SceneDescriptorPool)
+      Check(vkResetDescriptorPool(s_Data.Device, s_Data.SceneDescriptorPool, 0),
+            "vkResetDescriptorPool (scene)");
+  }
 }
 
 bool VulkanRenderer::Init(const uint32_t width, const uint32_t height)
@@ -4508,6 +5068,19 @@ bool VulkanRenderer::Init(const uint32_t width, const uint32_t height)
     CreateCommandsAndSync();
     CreateSwapchain();
     s_Data.Initialized = true;
+    GABVulkanConfig profilerConfig{};
+    profilerConfig.physicalDevice = s_Data.PhysicalDevice;
+    profilerConfig.device = s_Data.Device;
+    profilerConfig.queueFamilyIndex = s_Data.GraphicsQueueFamily;
+    profilerConfig.getCommandBuffer = ProfilerCommandBuffer;
+    profilerConfig.frameLatency = FramesInFlight;
+    profilerConfig.maxThreads = 1;
+    profilerConfig.maxScopes = 256;
+    profilerConfig.maxOccurrences = 4;
+    s_Data.ProfilerInstalled = gab_gpu_vulkan_install(&profilerConfig) != 0;
+    if (!s_Data.ProfilerInstalled)
+      gablog_log(LOG_WARN, __FILE__, __LINE__,
+        "GABDEBUG Vulkan GPU profiler could not be installed; CPU profiling remains active");
     return true;
   }
   catch (const std::exception& error)
@@ -4521,6 +5094,21 @@ bool VulkanRenderer::Init(const uint32_t width, const uint32_t height)
 void VulkanRenderer::Shutdown()
 {
   if (s_Data.Device) vkDeviceWaitIdle(s_Data.Device);
+  if (s_Data.ProfilerFrameActive)
+  {
+    gabprofiler_end_frame();
+    s_Data.ProfilerFrameActive = false;
+  }
+  if (s_Data.ProfilerUsed)
+  {
+    gabprofiler_unregister_thread();
+    s_Data.ProfilerUsed = false;
+  }
+  if (s_Data.ProfilerInstalled)
+  {
+    gabprofiler_shutdown_gpu_backend();
+    s_Data.ProfilerInstalled = false;
+  }
   ShutdownImGui();
   ShutdownSceneRenderer();
   DestroySwapchain();
@@ -4529,6 +5117,8 @@ void VulkanRenderer::Shutdown()
     vkDestroyRenderPass(s_Data.Device, s_Data.DepthPrepassRenderPass, nullptr);
   if (s_Data.LightingRenderPass)
     vkDestroyRenderPass(s_Data.Device, s_Data.LightingRenderPass, nullptr);
+  if (s_Data.CompositeRenderPass)
+    vkDestroyRenderPass(s_Data.Device, s_Data.CompositeRenderPass, nullptr);
   if (s_Data.ParticleRenderPass)
     vkDestroyRenderPass(s_Data.Device, s_Data.ParticleRenderPass, nullptr);
   if (s_Data.PresentRenderPass)
@@ -4555,13 +5145,21 @@ void VulkanRenderer::Shutdown()
 
 bool VulkanRenderer::Resize(const uint32_t width, const uint32_t height)
 {
-  if (!s_Data.Initialized || width == 0 || height == 0 || s_Data.FrameStarted) return false;
-  if (width != s_Data.RequestedWidth || height != s_Data.RequestedHeight)
+  if (!s_Data.Initialized || s_Data.FrameStarted) return false;
+  int framebufferWidth = 0, framebufferHeight = 0;
+  glfwGetFramebufferSize(Window::GetWindowPtr(), &framebufferWidth, &framebufferHeight);
+  const uint32_t targetWidth = framebufferWidth > 0
+    ? static_cast<uint32_t>(framebufferWidth) : width;
+  const uint32_t targetHeight = framebufferHeight > 0
+    ? static_cast<uint32_t>(framebufferHeight) : height;
+  if (targetWidth == 0 || targetHeight == 0) return false;
+  if (targetWidth != s_Data.RequestedWidth || targetHeight != s_Data.RequestedHeight)
   {
-    s_Data.RequestedWidth = width;
-    s_Data.RequestedHeight = height;
-    s_Data.SwapchainDirty = true;
+    s_Data.RequestedWidth = targetWidth;
+    s_Data.RequestedHeight = targetHeight;
   }
+  if (targetWidth != s_Data.Extent.width || targetHeight != s_Data.Extent.height)
+    s_Data.SwapchainDirty = true;
   if (!s_Data.SwapchainDirty) return true;
   try { RecreateSwapchain(); return true; }
   catch (const std::exception& error)
@@ -4576,6 +5174,8 @@ bool VulkanRenderer::BeginFrame()
   if (!s_Data.Initialized || s_Data.FrameStarted) return false;
   try
   {
+    if (s_Data.SceneResetPending)
+      ResetSceneResourcesNow();
     const VkFence frameFence = s_Data.FrameFences[s_Data.Frame];
     Check(vkWaitForFences(s_Data.Device, 1, &frameFence, VK_TRUE, UINT64_MAX),
           "vkWaitForFences");
@@ -4607,8 +5207,12 @@ bool VulkanRenderer::BeginFrame()
     s_Data.ParticlePassActive = false;
     s_Data.PresentPassActive = false;
     s_Data.RenderForEditor = false;
+    s_Data.ScreenUIOnly = false;
     s_Data.ClearColor = {0.008f, 0.012f, 0.025f, 1.0f};
     s_Data.CurrentEffects = RenderBackend::GetEffectSettings();
+    gabprofiler_begin_frame();
+    s_Data.ProfilerUsed = true;
+    s_Data.ProfilerFrameActive = true;
     return true;
   }
   catch (const std::exception& error)
@@ -4631,6 +5235,11 @@ bool VulkanRenderer::EndFrame(const bool vSync)
     }
     VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
     if (s_Data.PresentPassActive) vkCmdEndRenderPass(command);
+    if (s_Data.ProfilerFrameActive)
+    {
+      gabprofiler_end_frame();
+      s_Data.ProfilerFrameActive = false;
+    }
     Check(vkEndCommandBuffer(command), "vkEndCommandBuffer");
     const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -4667,6 +5276,11 @@ bool VulkanRenderer::EndFrame(const bool vSync)
   }
   catch (const std::exception& error)
   {
+    if (s_Data.ProfilerFrameActive)
+    {
+      gabprofiler_end_frame();
+      s_Data.ProfilerFrameActive = false;
+    }
     s_Data.FrameStarted = false;
     s_Data.RenderPassActive = false;
     s_Data.ParticlePassActive = false;
@@ -4682,6 +5296,7 @@ bool VulkanRenderer::InitSceneRenderer()
   if (s_Data.SceneInitialized) return true;
   try
   {
+    Camera::SetViewportSize(s_Data.Extent.width, s_Data.Extent.height);
     CreateSceneDescriptors();
     CreateShadowRenderPass();
     CreateShadowAttachments(RenderEffectSettings{}.DirectionalShadowResolution());
@@ -4712,7 +5327,9 @@ bool VulkanRenderer::InitSceneRenderer()
     CreateParticlePipeline();
     CreateDebugLinePipeline();
     CreatePostPipeline();
+    CreateBloomPipeline();
     CreateLightingPipeline();
+    CreateSkyboxPipeline();
     CreateTilePipeline();
     CreateCullPipeline();
     CreateHiZPipeline();
@@ -4730,31 +5347,21 @@ bool VulkanRenderer::InitSceneRenderer()
 void VulkanRenderer::ResetSceneResources()
 {
   if (!s_Data.Device) return;
-  vkDeviceWaitIdle(s_Data.Device);
-  for (auto& mesh : s_Data.Meshes)
+  if (s_Data.FrameStarted)
   {
-    DestroyBuffer(mesh.second.Vertices);
-    DestroyBuffer(mesh.second.Indices);
+    // SceneManager can release the old scene while this frame's command buffer
+    // still references it. Defer destruction until the submitted frame is idle.
+    s_Data.SceneResetPending = true;
+    s_Data.ModelPreviews.clear();
+    return;
   }
-  s_Data.Meshes.clear();
-  for (auto& model : s_Data.Models)
-    for (GPUBuffer& bones : model.second.Bones)
-      DestroyBuffer(bones);
-  s_Data.Models.clear();
-  for (auto& texture : s_Data.Textures)
-    DestroyTexture(texture.second);
-  s_Data.Textures.clear();
-  s_Data.HasSkybox = false;
-  if (s_Data.SceneDescriptorPool)
-    Check(vkResetDescriptorPool(s_Data.Device, s_Data.SceneDescriptorPool, 0),
-          "vkResetDescriptorPool (scene)");
+  ResetSceneResourcesNow();
 }
 
 void VulkanRenderer::ShutdownSceneRenderer()
 {
   if (!s_Data.Device) return;
-  vkDeviceWaitIdle(s_Data.Device);
-  ResetSceneResources();
+  ResetSceneResourcesNow();
   if (s_Data.ScenePipeline)
     vkDestroyPipeline(s_Data.Device, s_Data.ScenePipeline, nullptr);
   if (s_Data.DepthPrepassPipeline)
@@ -4769,8 +5376,16 @@ void VulkanRenderer::ShutdownSceneRenderer()
     vkDestroyPipeline(s_Data.Device, s_Data.DebugLinePipeline, nullptr);
   if (s_Data.PostPipeline)
     vkDestroyPipeline(s_Data.Device, s_Data.PostPipeline, nullptr);
+  if (s_Data.CompositePipeline)
+    vkDestroyPipeline(s_Data.Device, s_Data.CompositePipeline, nullptr);
+  if (s_Data.BloomDownsamplePipeline)
+    vkDestroyPipeline(s_Data.Device, s_Data.BloomDownsamplePipeline, nullptr);
+  if (s_Data.BloomUpsamplePipeline)
+    vkDestroyPipeline(s_Data.Device, s_Data.BloomUpsamplePipeline, nullptr);
   if (s_Data.LightingPipeline)
     vkDestroyPipeline(s_Data.Device, s_Data.LightingPipeline, nullptr);
+  if (s_Data.SkyboxPipeline)
+    vkDestroyPipeline(s_Data.Device, s_Data.SkyboxPipeline, nullptr);
   if (s_Data.TilePipeline)
     vkDestroyPipeline(s_Data.Device, s_Data.TilePipeline, nullptr);
   if (s_Data.CullPipeline)
@@ -4791,6 +5406,8 @@ void VulkanRenderer::ShutdownSceneRenderer()
     vkDestroyPipelineLayout(s_Data.Device, s_Data.DebugLinePipelineLayout, nullptr);
   if (s_Data.PostPipelineLayout)
     vkDestroyPipelineLayout(s_Data.Device, s_Data.PostPipelineLayout, nullptr);
+  if (s_Data.BloomPipelineLayout)
+    vkDestroyPipelineLayout(s_Data.Device, s_Data.BloomPipelineLayout, nullptr);
   if (s_Data.LightingPipelineLayout)
     vkDestroyPipelineLayout(s_Data.Device, s_Data.LightingPipelineLayout, nullptr);
   if (s_Data.TilePipelineLayout)
@@ -4834,6 +5451,10 @@ void VulkanRenderer::ShutdownSceneRenderer()
     vkDestroyDescriptorPool(s_Data.Device, s_Data.PostDescriptorPool, nullptr);
   if (s_Data.PostDescriptorSetLayout)
     vkDestroyDescriptorSetLayout(s_Data.Device, s_Data.PostDescriptorSetLayout, nullptr);
+  if (s_Data.BloomDescriptorPool)
+    vkDestroyDescriptorPool(s_Data.Device, s_Data.BloomDescriptorPool, nullptr);
+  if (s_Data.BloomDescriptorSetLayout)
+    vkDestroyDescriptorSetLayout(s_Data.Device, s_Data.BloomDescriptorSetLayout, nullptr);
   if (s_Data.LightingDescriptorPool)
     vkDestroyDescriptorPool(s_Data.Device, s_Data.LightingDescriptorPool, nullptr);
   if (s_Data.LightingDescriptorSetLayout)
@@ -4857,7 +5478,11 @@ void VulkanRenderer::ShutdownSceneRenderer()
   s_Data.ParticlePipeline = VK_NULL_HANDLE;
   s_Data.DebugLinePipeline = VK_NULL_HANDLE;
   s_Data.PostPipeline = VK_NULL_HANDLE;
+  s_Data.CompositePipeline = VK_NULL_HANDLE;
+  s_Data.BloomDownsamplePipeline = VK_NULL_HANDLE;
+  s_Data.BloomUpsamplePipeline = VK_NULL_HANDLE;
   s_Data.LightingPipeline = VK_NULL_HANDLE;
+  s_Data.SkyboxPipeline = VK_NULL_HANDLE;
   s_Data.TilePipeline = VK_NULL_HANDLE;
   s_Data.CullPipeline = VK_NULL_HANDLE;
   s_Data.HiZPipeline = VK_NULL_HANDLE;
@@ -4868,6 +5493,7 @@ void VulkanRenderer::ShutdownSceneRenderer()
   s_Data.ParticlePipelineLayout = VK_NULL_HANDLE;
   s_Data.DebugLinePipelineLayout = VK_NULL_HANDLE;
   s_Data.PostPipelineLayout = VK_NULL_HANDLE;
+  s_Data.BloomPipelineLayout = VK_NULL_HANDLE;
   s_Data.LightingPipelineLayout = VK_NULL_HANDLE;
   s_Data.TilePipelineLayout = VK_NULL_HANDLE;
   s_Data.CullPipelineLayout = VK_NULL_HANDLE;
@@ -4881,6 +5507,8 @@ void VulkanRenderer::ShutdownSceneRenderer()
   s_Data.PostSampler = VK_NULL_HANDLE;
   s_Data.PostDescriptorPool = VK_NULL_HANDLE;
   s_Data.PostDescriptorSetLayout = VK_NULL_HANDLE;
+  s_Data.BloomDescriptorPool = VK_NULL_HANDLE;
+  s_Data.BloomDescriptorSetLayout = VK_NULL_HANDLE;
   s_Data.LightingDescriptorPool = VK_NULL_HANDLE;
   s_Data.LightingDescriptorSetLayout = VK_NULL_HANDLE;
   s_Data.TileDescriptorPool = VK_NULL_HANDLE;
@@ -4988,79 +5616,100 @@ void VulkanRenderer::DrawScene(DeltaTime& dt, const std::function<void()>& scene
                                const RenderEffectSettings& effects)
 {
   if (!s_Data.FrameStarted || !s_Data.SceneInitialized) return;
+  s_Data.ScreenUIOnly = false;
   s_Data.CurrentEffects = effects;
   s_Data.RenderForEditor = renderForEditor;
-  if (advanceSimulation) sceneLogic();
-  if (advanceSimulation)
+  glm::mat4 lightViewProjection{1.0f};
   {
-    ModelManager::UpdateControllers(dt);
-    PhysX::Simulate(dt);
-    ModelManager::UpdateTransforms(dt);
-    Camera::OnUpdate(dt);
-    AudioManager::SetListenerLocation(Camera::GetPosition());
-    AudioManager::SetListenerOrientation(Camera::GetForwardDirection(), Camera::GetUpDirection());
-    AudioManager::UpdateAllMusic();
+    ScopedProfile profile("MISC UPDATE PASS");
+    if (advanceSimulation) sceneLogic();
+    if (advanceSimulation)
+    {
+      ModelManager::UpdateControllers(dt);
+      PhysX::Simulate(dt);
+      ModelManager::UpdateTransforms(dt);
+      Camera::OnUpdate(dt);
+      AudioManager::SetListenerLocation(Camera::GetPosition());
+      AudioManager::SetListenerOrientation(Camera::GetForwardDirection(), Camera::GetUpDirection());
+      AudioManager::UpdateAllMusic();
+    }
+    EnsureShadowSize(effects.DirectionalShadowResolution());
+    EnsurePointShadowSize(effects.PointShadowResolution());
+    UpdateBoneBuffers();
+    lightViewProjection = CalculateLightViewProjection();
+    SelectPointShadowLights(effects);
+    UpdateSceneFrame(effects, lightViewProjection);
   }
 
-  EnsureShadowSize(effects.DirectionalShadowResolution());
-  EnsurePointShadowSize(effects.PointShadowResolution());
-  UpdateBoneBuffers();
-  const glm::mat4 lightViewProjection = CalculateLightViewProjection();
-  SelectPointShadowLights(effects);
-  UpdateSceneFrame(effects, lightViewProjection);
-  const bool directionalCulled = effects.ShadowQuality != GraphicsQuality::Off &&
-    PrepareGPUCull(false, lightViewProjection, false);
-  DrawShadowPass(effects, lightViewProjection, directionalCulled);
-  DrawPointShadowPass(effects);
+  {
+    ScopedProfile profile("DIRECT SHADOW PASS");
+    const bool directionalCulled = effects.ShadowQuality != GraphicsQuality::Off &&
+      PrepareGPUCull(false, lightViewProjection, false);
+    DrawShadowPass(effects, lightViewProjection, directionalCulled);
+  }
+  {
+    ScopedProfile profile("OMNI SHADOW PASS");
+    DrawPointShadowPass(effects);
+  }
   glm::mat4 cameraViewProjectionCorrection(1.0f);
   cameraViewProjectionCorrection[1][1] = -1.0f;
   cameraViewProjectionCorrection[2][2] = 0.5f;
   cameraViewProjectionCorrection[3][2] = 0.5f;
   const glm::mat4 cameraViewProjection =
     cameraViewProjectionCorrection * Camera::GetViewProjection();
-  const bool prepassCulled = PrepareGPUCull(false, cameraViewProjection, true);
-  DrawDepthPrepass(prepassCulled);
-  BuildHiZ();
-  const bool gpuCulled = PrepareGPUCull(true, cameraViewProjection, true);
-  BeginMainRenderPass();
-
-  if (s_Data.ScenePipeline && gpuCulled)
   {
-    VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
-    const VkViewport viewport{
-      0.0f, 0.0f, static_cast<float>(s_Data.Extent.width),
-      static_cast<float>(s_Data.Extent.height), 0.0f, 1.0f};
-    const VkRect2D scissor{{0, 0}, s_Data.Extent};
-    vkCmdSetViewport(command, 0, 1, &viewport);
-    vkCmdSetScissor(command, 0, 1, &scissor);
-    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Data.ScenePipeline);
+    ScopedProfile profile("GPU DEPTH PREPASS + HIZ");
+    const bool prepassCulled = PrepareGPUCull(false, cameraViewProjection, true);
+    DrawDepthPrepass(prepassCulled);
+    BuildHiZ();
+  }
 
-    glm::mat4 clipCorrection(1.0f);
-    clipCorrection[1][1] = -1.0f;
-    clipCorrection[2][2] = 0.5f;
-    clipCorrection[3][2] = 0.5f;
-    const ScenePushConstants constants{
-      clipCorrection * Camera::GetViewProjection(), glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
-    for (const CullDrawRecord& record : s_Data.CullDrawRecords)
+  {
+    ScopedProfile profile("GEOMETRY PASS");
+    const bool gpuCulled = PrepareGPUCull(true, cameraViewProjection, true);
+    BeginMainRenderPass();
+    if (s_Data.ScenePipeline && gpuCulled)
     {
-      ScenePushConstants drawConstants = constants;
-      drawConstants.DrawParams.x = record.Brightness;
-      drawConstants.DrawParams.y = static_cast<float>(record.TransformOffset);
-      vkCmdPushConstants(command, s_Data.ScenePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                         0, sizeof(drawConstants), &drawConstants);
-      const VkDeviceSize offset = 0;
-      vkCmdBindVertexBuffers(command, 0, 1, &record.Mesh->Vertices.Buffer, &offset);
-      vkCmdBindIndexBuffer(command, record.Mesh->Indices.Buffer, 0, VK_INDEX_TYPE_UINT32);
-      vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              s_Data.ScenePipelineLayout, 0, 1,
-                              &record.Descriptor, 0, nullptr);
-      vkCmdDrawIndexedIndirect(command, s_Data.CullFrames[s_Data.Frame].Commands.Buffer,
-        static_cast<VkDeviceSize>(record.CommandIndex) * sizeof(VkDrawIndexedIndirectCommand),
-        1, sizeof(VkDrawIndexedIndirectCommand));
+      VkCommandBuffer command = s_Data.CommandBuffers[s_Data.Frame];
+      const VkViewport viewport{
+        0.0f, 0.0f, static_cast<float>(s_Data.Extent.width),
+        static_cast<float>(s_Data.Extent.height), 0.0f, 1.0f};
+      const VkRect2D scissor{{0, 0}, s_Data.Extent};
+      vkCmdSetViewport(command, 0, 1, &viewport);
+      vkCmdSetScissor(command, 0, 1, &scissor);
+      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, s_Data.ScenePipeline);
+
+      glm::mat4 clipCorrection(1.0f);
+      clipCorrection[1][1] = -1.0f;
+      clipCorrection[2][2] = 0.5f;
+      clipCorrection[3][2] = 0.5f;
+      const ScenePushConstants constants{
+        clipCorrection * Camera::GetViewProjection(), glm::vec4(1.0f, 0.0f, 0.0f, 0.0f)};
+      for (const CullDrawRecord& record : s_Data.CullDrawRecords)
+      {
+        ScenePushConstants drawConstants = constants;
+        drawConstants.DrawParams.x = record.Brightness;
+        drawConstants.DrawParams.y = static_cast<float>(record.TransformOffset);
+        vkCmdPushConstants(command, s_Data.ScenePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(drawConstants), &drawConstants);
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(command, 0, 1, &record.Mesh->Vertices.Buffer, &offset);
+        vkCmdBindIndexBuffer(command, record.Mesh->Indices.Buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                s_Data.ScenePipelineLayout, 0, 1,
+                                &record.Descriptor, 0, nullptr);
+        vkCmdDrawIndexedIndirect(command, s_Data.CullFrames[s_Data.Frame].Commands.Buffer,
+          static_cast<VkDeviceSize>(record.CommandIndex) * sizeof(VkDrawIndexedIndirectCommand),
+          1, sizeof(VkDrawIndexedIndirectCommand));
+      }
     }
   }
-  DrawNativeDebugVisualizations();
-  ParticleRenderer::UpdateAndRender(dt);
+  BeginParticleRenderPass();
+  {
+    ScopedProfile profile("FORWARD PASS");
+    DrawNativeDebugVisualizations();
+    ParticleRenderer::UpdateAndRender(dt);
+  }
   BeginPresentRenderPass();
 }
 
@@ -5327,6 +5976,7 @@ void VulkanRenderer::RenderImGuiDrawData()
 {
   if (s_Data.ImGuiInitialized && s_Data.FrameStarted && ImGui::GetDrawData())
   {
+    ScopedProfile profile("UI PASS");
     BeginPresentRenderPass();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), s_Data.CommandBuffers[s_Data.Frame]);
   }
@@ -5364,6 +6014,12 @@ bool VulkanRenderer::BeginScreenUI()
 bool VulkanRenderer::DrawScreenQuad(const glm::mat4& transform, const glm::vec4& color)
 {
   if (!BeginScreenUI()) return false;
+  // Game UI coordinates are expressed in GLFW's logical window units.  The
+  // swapchain extent is in framebuffer pixels and can be larger on a scaled
+  // Windows display.  ImGui applies DisplayFramebufferScale when it emits the
+  // Vulkan viewport, so using Extent here applied the DPI scale a second time.
+  const float uiHeight = static_cast<float>(std::max(Window::GetHeight(), 1u));
+  const ImVec2 uiOrigin = ImGui::GetMainViewport()->Pos;
   static constexpr std::array<glm::vec4, 4> corners{
     glm::vec4(-0.5f, -0.5f, 0.0f, 1.0f), glm::vec4(0.5f, -0.5f, 0.0f, 1.0f),
     glm::vec4(0.5f, 0.5f, 0.0f, 1.0f), glm::vec4(-0.5f, 0.5f, 0.0f, 1.0f)};
@@ -5371,7 +6027,7 @@ bool VulkanRenderer::DrawScreenQuad(const glm::mat4& transform, const glm::vec4&
   for (size_t index = 0; index < corners.size(); ++index)
   {
     const glm::vec4 point = transform * corners[index];
-    positions[index] = {point.x, static_cast<float>(s_Data.Extent.height) - point.y};
+    positions[index] = {uiOrigin.x + point.x, uiOrigin.y + uiHeight - point.y};
   }
   ImGui::GetBackgroundDrawList()->AddQuadFilled(
     positions[0], positions[1], positions[2], positions[3],
@@ -5384,6 +6040,8 @@ bool VulkanRenderer::DrawScreenText(const Font* font, const std::string& text,
                                     const glm::vec4& color)
 {
   if (text.empty() || !BeginScreenUI()) return false;
+  const float uiHeight = static_cast<float>(std::max(Window::GetHeight(), 1u));
+  const ImVec2 uiOrigin = ImGui::GetMainViewport()->Pos;
   if (font && font->m_AtlasHandle != 0 && !font->m_Characters.empty())
   {
     const auto atlas = s_Data.FontAtlases.find(font->m_AtlasHandle);
@@ -5406,14 +6064,14 @@ bool VulkanRenderer::DrawScreenText(const Font* font, const std::string& text,
         const auto glyphIt = font->m_Characters.find(static_cast<char>(character));
         if (glyphIt == font->m_Characters.end()) continue;
         const Character& glyph = glyphIt->second;
-        const float x = position.x + cursorX + glyph.Bearing.x * size;
+        const float x = uiOrigin.x + position.x + cursorX + glyph.Bearing.x * size;
         const float y = position.y + baselineY + (glyph.Bearing.y - glyph.Size.y) * size;
         const float glyphWidth = glyph.Size.x * size;
         const float glyphHeight = glyph.Size.y * size;
         if (glyphWidth > 0.0f && glyphHeight > 0.0f)
         {
-          const float top = static_cast<float>(s_Data.Extent.height) - (y + glyphHeight);
-          const float bottom = static_cast<float>(s_Data.Extent.height) - y;
+          const float top = uiOrigin.y + uiHeight - (y + glyphHeight);
+          const float bottom = uiOrigin.y + uiHeight - y;
           const ImVec2 uvTopLeft(glyph.UVTopLeft.x, glyph.UVTopLeft.y);
           const ImVec2 uvBottomRight(glyph.UVBottomRight.x, glyph.UVBottomRight.y);
           drawList->AddImageQuad(texture,
@@ -5432,8 +6090,8 @@ bool VulkanRenderer::DrawScreenText(const Font* font, const std::string& text,
   const ImVec2 bounds = imguiFont->CalcTextSizeA(
     fontSize, std::numeric_limits<float>::max(), 0.0f, text.c_str());
   const ImVec2 topLeft{
-    position.x - bounds.x * 0.5f,
-    static_cast<float>(s_Data.Extent.height) - position.y - bounds.y * 0.5f};
+    uiOrigin.x + position.x - bounds.x * 0.5f,
+    uiOrigin.y + uiHeight - position.y - bounds.y * 0.5f};
   ImGui::GetBackgroundDrawList()->AddText(
     imguiFont, fontSize, topLeft,
     ImGui::ColorConvertFloat4ToU32(ImVec4(color.r, color.g, color.b, color.a)),
@@ -5445,6 +6103,7 @@ void VulkanRenderer::Clear(const glm::vec4& color)
 {
   if (!s_Data.FrameStarted) return;
   s_Data.ClearColor = color;
+  s_Data.ScreenUIOnly = true;
   BeginMainRenderPass();
 }
 

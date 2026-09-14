@@ -10,7 +10,10 @@
 #include "../input/KeyEvent.h"
 #include <gabdebug.h>
 #include <stb_image.h>
+#include "Camera.h"
 #include "Settings.h"
+
+#include <algorithm>
 
 GLFWwindow* m_Window;
 GLFWmonitor* m_Monitor;
@@ -265,9 +268,11 @@ void Window::SetResolution(uint32_t width, uint32_t height)
 void Window::CenterWindowPos()
 {
   glfwGetWindowSize(m_Window, &currWidth, &currHeight);
-  int32_t xpos = (m_Mode->width - currWidth) / 2, ypos = (m_Mode->height - currHeight) / 2;
-
-  glfwSetWindowPos(m_Window, xpos, ypos);
+  int monitorX = 0, monitorY = 0, workWidth = m_Mode->width, workHeight = m_Mode->height;
+  glfwGetMonitorWorkarea(m_Monitor, &monitorX, &monitorY, &workWidth, &workHeight);
+  glfwSetWindowPos(m_Window,
+    monitorX + (workWidth - currWidth) / 2,
+    monitorY + (workHeight - currHeight) / 2);
 }
 
 void Window::SetFullscreen(bool full)
@@ -283,6 +288,13 @@ void Window::SetWindowMode(WindowMode mode, uint32_t width, uint32_t height)
     glfwGetWindowSize(m_Window, &currWidth, &currHeight);
   }
 
+  width = std::max(width, 1u);
+  height = std::max(height, 1u);
+
+  int monitorX = 0, monitorY = 0;
+  int workWidth = m_Mode->width, workHeight = m_Mode->height;
+  glfwGetMonitorWorkarea(m_Monitor, &monitorX, &monitorY, &workWidth, &workHeight);
+
   switch (mode)
   {
     case WindowMode::Fullscreen:
@@ -290,19 +302,36 @@ void Window::SetWindowMode(WindowMode mode, uint32_t width, uint32_t height)
       glfwSetWindowMonitor(m_Window, m_Monitor, 0, 0, static_cast<int>(width), static_cast<int>(height), m_Mode->refreshRate);
       break;
     case WindowMode::Borderless:
+    {
+      glfwGetMonitorPos(m_Monitor, &monitorX, &monitorY);
       glfwSetWindowAttrib(m_Window, GLFW_DECORATED, GLFW_FALSE);
-      glfwSetWindowMonitor(m_Window, nullptr, 0, 0, m_Mode->width, m_Mode->height, 0);
+      glfwSetWindowMonitor(m_Window, nullptr, monitorX, monitorY,
+                           m_Mode->width, m_Mode->height, GLFW_DONT_CARE);
       break;
+    }
     case WindowMode::Windowed:
     default:
+    {
+      // GLFW sizes are client-area sizes in logical screen coordinates. Keep
+      // the requested window inside the usable monitor area and restore the
+      // decoration before selecting its final client size.
+      width = std::min(width, static_cast<uint32_t>(std::max(workWidth, 1)));
+      height = std::min(height, static_cast<uint32_t>(std::max(workHeight, 1)));
       glfwSetWindowAttrib(m_Window, GLFW_DECORATED, GLFW_TRUE);
-      glfwSetWindowMonitor(m_Window, nullptr, currX, currY, static_cast<int>(width), static_cast<int>(height), 0);
-      CenterWindowPos();
+      glfwSetWindowMonitor(m_Window, nullptr, currX, currY,
+                           static_cast<int>(width), static_cast<int>(height), GLFW_DONT_CARE);
+      glfwSetWindowPos(m_Window,
+        monitorX + (workWidth - static_cast<int>(width)) / 2,
+        monitorY + (workHeight - static_cast<int>(height)) / 2);
       break;
+    }
   }
 
-  m_Data.Width = mode == WindowMode::Borderless ? static_cast<uint32_t>(m_Mode->width) : width;
-  m_Data.Height = mode == WindowMode::Borderless ? static_cast<uint32_t>(m_Mode->height) : height;
+  int actualWidth = 0, actualHeight = 0;
+  glfwGetWindowSize(m_Window, &actualWidth, &actualHeight);
+  m_Data.Width = static_cast<uint32_t>(std::max(actualWidth, 1));
+  m_Data.Height = static_cast<uint32_t>(std::max(actualHeight, 1));
+  Camera::SetViewportSize(m_Data.Width, m_Data.Height);
   if (m_Data.API == GraphicsAPI::OpenGL)
     glViewport(0, 0, m_Data.Width, m_Data.Height);
   SetVSync(Settings::GetVSync());
@@ -378,6 +407,7 @@ bool Window::OnWindowResize(WindowResizeEvent& e)
 	}
 
 	m_isMinimized = false;
+  Camera::SetViewportSize(e.GetWidth(), e.GetHeight());
   if (m_Data.API == GraphicsAPI::OpenGL)
     glViewport(0, 0, e.GetWidth(), e.GetHeight());
 

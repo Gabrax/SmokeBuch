@@ -22,7 +22,8 @@ namespace
         .NativeUIRenderer = true,
         .NativeDebugLines = true,
         .NativePhysicsDebug = true,
-        .PointLightShadows = true
+        .PointLightShadows = true,
+        .TimestampProfiler = true
       };
       return capabilities;
     }

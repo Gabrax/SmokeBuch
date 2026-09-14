@@ -1244,6 +1244,7 @@ void OpenGLRenderer::DrawScene(DeltaTime& dt, const std::function<void()>& scene
     s_Data.s_Shaders.LightShader->SetBool("u_TiledLightingEnabled", tiledLighting);
     s_Data.s_Shaders.LightShader->SetInt("u_TiledDebugMode",
       tiledLighting ? static_cast<int>(RenderBackend::DebugSettings().TiledLightingMode) : 0);
+    s_Data.s_Shaders.LightShader->SetFloat("u_BloomThreshold", effects.BloomThreshold);
     s_Data.s_Shaders.LightShader->SetMat4("u_DirectShadowViewProj", s_Data.m_DirectShadowBuffer->GetShadowViewProj());
 
     DrawFullscreenQuad();

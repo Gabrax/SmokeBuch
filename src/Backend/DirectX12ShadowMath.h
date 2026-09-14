@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <glm/gtc/matrix_transform.hpp>
 
-namespace DX12Shadow
+namespace ShadowMath
 {
 inline glm::mat4 PointViewProjection(const glm::vec3& lightPosition,
                                     uint32_t face, float nearPlane, float farPlane)
@@ -25,4 +25,10 @@ inline glm::mat4 PointViewProjection(const glm::vec3& lightPosition,
   return glm::perspectiveLH_ZO(glm::radians(90.0f), 1.0f, nearPlane, farPlane)
     * glm::lookAtLH(lightPosition, lightPosition + directions[face], upDirections[face]);
 }
+}
+
+// Compatibility name for existing DX12 tests and call sites.
+namespace DX12Shadow
+{
+using ShadowMath::PointViewProjection;
 }

@@ -4,6 +4,7 @@ struct ScenePushConstants
 {
   float4x4 ModelViewProjection;
   float4 DrawParams;
+  float4 ShadowLightPosition;
 };
 
 [[vk::push_constant]] ConstantBuffer<ScenePushConstants> Scene;
@@ -24,10 +25,24 @@ struct VertexInput
   uint InstanceID : SV_InstanceID;
 };
 
-float4 VSMain(VertexInput input) : SV_Position
+struct VertexOutput
+{
+  float4 Position : SV_Position;
+  float3 WorldPosition : TEXCOORD0;
+};
+
+VertexOutput VSMain(VertexInput input)
 {
   const float4x4 skin = GabglSkinMatrix(input.BoneIDs, input.Weights, 0, true);
-  return mul(Scene.ModelViewProjection,
-             mul(VisibleTransforms[(uint)Scene.DrawParams.y + input.InstanceID],
-                 mul(skin, float4(input.Position, 1.0f))));
+  const float4 world = mul(VisibleTransforms[(uint)Scene.DrawParams.y + input.InstanceID],
+                           mul(skin, float4(input.Position, 1.0f)));
+  VertexOutput output;
+  output.Position = mul(Scene.ModelViewProjection, world);
+  output.WorldPosition = world.xyz;
+  return output;
+}
+
+float PointPSMain(VertexOutput input) : SV_Target
+{
+  return length(input.WorldPosition - Scene.ShadowLightPosition.xyz);
 }

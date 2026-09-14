@@ -10,9 +10,9 @@ struct SceneFrameData
   float4x4 LightViewProjection;
   float4x4 InverseViewProjection;
   float4 CameraPosition;
-  float4 LightPositions[32];
-  float4 LightDirections[32];
-  float4 LightColors[32];
+  float4 LightPositions[128];
+  float4 LightDirections[128];
+  float4 LightColors[128];
   float4 Params;
   float4 Effects;
   float4 ShadowInfo;
@@ -32,6 +32,11 @@ struct SceneFrameData
 [[vk::binding(12, 0)]] SamplerState PointShadowSampler;
 [[vk::binding(13, 0)]] StructuredBuffer<uint2> TileGrid;
 [[vk::binding(14, 0)]] StructuredBuffer<uint> TileIndices;
+[[vk::binding(15, 0)]] StructuredBuffer<float2> ShadowOffsets;
+
+#define GABGL_FLOAT3 float3
+#define GABGL_SATURATE(value) saturate(value)
+#include "common/material_lighting.slang"
 
 struct VertexOutput
 {
@@ -52,16 +57,27 @@ float DirectionalShadow(float3 worldPosition, float3 normal, float3 toLight)
   if (Frame.Params.y < 0.5f) return 1.0f;
   const float4 shadowPosition = mul(Frame.LightViewProjection, float4(worldPosition, 1.0f));
   const float3 projected = shadowPosition.xyz / max(shadowPosition.w, 0.00001f);
-  const float2 uv = projected.xy * 0.5f + 0.5f;
+  const float2 uv = projected.xy * float2(0.5f, -0.5f) + 0.5f;
   if (any(uv < 0.0f) || any(uv > 1.0f) || projected.z < 0.0f || projected.z > 1.0f)
     return 1.0f;
-  const float bias = max(0.0004f * (1.0f - dot(normal, toLight)), 0.00008f);
+  const float bias = max(0.0015f * (1.0f - saturate(dot(normal, toLight))), 0.00015f);
   float visibility = 0.0f;
-  for (int y = -1; y <= 1; ++y)
-    for (int x = -1; x <= 1; ++x)
-      visibility += projected.z - bias <= ShadowTexture.Sample(
-        ShadowSampler, uv + float2(x, y) * Frame.ShadowInfo.xx) ? 1.0f : 0.2f;
-  return visibility / 9.0f;
+  const uint filterSize = clamp((uint)Frame.TileInfo.w, 2u, 4u);
+  const uint sampleCount = filterSize * filterSize;
+  uint shadowWidth, shadowHeight;
+  ShadowTexture.GetDimensions(shadowWidth, shadowHeight);
+  const uint2 pattern = uint2(floor(
+    float2(uv.x, 1.0f - uv.y) * float2(shadowWidth, shadowHeight))) % 16u;
+  const uint offsetBase = (pattern.y * 16u + pattern.x) * sampleCount;
+  const float radius = 0.5f + 0.5f * (float)filterSize;
+  for (uint sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex)
+  {
+    const float2 offset = ShadowOffsets[offsetBase + sampleIndex] *
+                          radius * float2(1.0f, -1.0f) * Frame.ShadowInfo.xx;
+    const float depth = ShadowTexture.SampleLevel(ShadowSampler, uv + offset, 0).r;
+    visibility += projected.z - bias <= depth ? 1.0f : 0.15f;
+  }
+  return visibility / max((float)sampleCount, 1.0f);
 }
 
 float PointShadowDepth(int slot, float3 direction)
@@ -81,36 +97,37 @@ float PointShadow(int lightIndex, float3 worldPosition, float3 normal, float3 to
   if (slot < 0) return 1.0f;
   const float3 offset = worldPosition - Frame.LightPositions[lightIndex].xyz;
   const float distanceToLight = length(offset);
-  const float majorDistance = max(max(abs(offset.x), abs(offset.y)), abs(offset.z));
-  if (distanceToLight >= Frame.ShadowInfo.w || majorDistance <= 0.0001f) return 1.0f;
-  const float nearPlane = 0.1f;
-  const float farPlane = Frame.ShadowInfo.w;
-  const float referenceDepth = farPlane / (farPlane - nearPlane) -
-    farPlane * nearPlane / ((farPlane - nearPlane) * majorDistance);
-  const float storedDepth = PointShadowDepth(slot, offset);
-  const float bias = max(0.0025f * (1.0f - dot(normal, toLight)), 0.0008f);
-  return referenceDepth - bias <= storedDepth ? 1.0f : 0.2f;
+  if (distanceToLight >= Frame.ShadowInfo.w || distanceToLight <= 0.0001f) return 1.0f;
+  const float3 direction = offset / distanceToLight;
+  const float bias = max(0.03f * (1.0f - dot(normal, toLight)), 0.003f);
+  uint shadowWidth, shadowHeight;
+  PointShadow0.GetDimensions(shadowWidth, shadowHeight);
+  const float filterRadius = (2.0f / max((float)shadowWidth, 1.0f)) *
+    (1.0f + 2.0f * distanceToLight / Frame.ShadowInfo.w);
+  const float3 offsets[4] = {
+    float3(1, 1, 1), float3(-1, -1, 1),
+    float3(-1, 1, -1), float3(1, -1, -1)};
+  float occluded = 0.0f;
+  for (uint sampleIndex = 0; sampleIndex < 4; ++sampleIndex)
+    occluded += distanceToLight - bias > PointShadowDepth(
+      slot, direction + offsets[sampleIndex] * filterRadius) ? 1.0f : 0.0f;
+  return lerp(1.0f, 0.15f, occluded * 0.25f);
 }
 
 float4 PSMain(VertexOutput input) : SV_Target
 {
   const float4 albedoSample = GBufferAlbedo.Sample(GBufferSampler, input.TexCoords);
   if (albedoSample.a < 0.5f)
-  {
-    if (Frame.ShadowInfo.y < 0.5f) return 0.0f;
-    const float2 clip = input.TexCoords * 2.0f - 1.0f;
-    const float4 farPoint = mul(Frame.InverseViewProjection, float4(clip, 1.0f, 1.0f));
-    const float3 direction = normalize(farPoint.xyz / max(abs(farPoint.w), 0.00001f)
-                                       - Frame.CameraPosition.xyz);
-    return float4(SkyboxTexture.Sample(GBufferSampler, direction).rgb, 1.0f);
-  }
+    return float4(0.0f, 0.0f, 0.0f, 1.0f);
   const float4 normalSpecular = GBufferNormal.Sample(GBufferSampler, input.TexCoords);
-  const float3 worldPosition = GBufferPosition.Sample(GBufferSampler, input.TexCoords).xyz;
+  const float4 positionData = GBufferPosition.Sample(GBufferSampler, input.TexCoords);
+  const float3 worldPosition = positionData.xyz;
   const float3 normal = normalize(normalSpecular.xyz);
   const float3 viewDirection = normalize(Frame.CameraPosition.xyz - worldPosition);
   const float3 specularColor = normalSpecular.www;
-  float3 color = albedoSample.rgb * 0.08f;
-  const int lightCount = min((int)Frame.Params.x, 32);
+  const float shininess = GabglMaterialShininess(normalSpecular.w);
+  float3 color = 0.0f;
+  const int lightCount = min((int)Frame.Params.x, 128);
   uint tileOffset = 0;
   int tileLightCount = lightCount;
   if (Frame.TileInfo.y > 0.5f)
@@ -119,7 +136,7 @@ float4 PSMain(VertexOutput input) : SV_Target
     const uint tileIndex = (pixel.y / 16) * (uint)Frame.TileInfo.x + pixel.x / 16;
     const uint2 tile = TileGrid[tileIndex];
     tileOffset = tile.x;
-    tileLightCount = min((int)tile.y, 32);
+    tileLightCount = min((int)tile.y, 128);
   }
   for (int tileLight = 0; tileLight < tileLightCount; ++tileLight)
   {
@@ -136,32 +153,32 @@ float4 PSMain(VertexOutput input) : SV_Target
       const float3 offset = Frame.LightPositions[index].xyz - worldPosition;
       const float distanceToLight = max(length(offset), 0.0001f);
       toLight = offset / distanceToLight;
-      attenuation = 1.0f / (1.0f + 0.09f * distanceToLight +
-                           0.032f * distanceToLight * distanceToLight);
+      attenuation = GabglDistanceAttenuation(distanceToLight) *
+        (1.0f - smoothstep(16.0f, 20.0f, distanceToLight));
       if (type == 2)
-      {
-        const float theta = dot(normalize(-toLight), normalize(Frame.LightDirections[index].xyz));
-        intensity = saturate((theta - cos(0.3054326191f)) /
-                             max(cos(0.2181661565f) - cos(0.3054326191f), 0.0001f));
-      }
+        intensity = GabglSpotIntensity(-toLight, Frame.LightDirections[index].xyz);
     }
     const float shadow = type == 0
       ? DirectionalShadow(worldPosition, normal, toLight)
       : (type == 1 ? PointShadow(index, worldPosition, normal, toLight) : 1.0f);
-    const float diffuse = max(dot(normal, toLight), 0.0f);
-    const float specular = pow(max(dot(viewDirection, reflect(-toLight, normal)), 0.0f),
-                               8.0f + 120.0f * saturate(normalSpecular.w));
-    color += Frame.LightColors[index].rgb *
-      (albedoSample.rgb * diffuse + specularColor * specular) *
-      attenuation * intensity * shadow;
+    color += GabglEvaluateLight(
+      Frame.LightColors[index].rgb, albedoSample.rgb, specularColor,
+      normal, viewDirection, toLight, shininess,
+      attenuation, intensity, shadow);
   }
+  color *= max(positionData.a, 1.0f);
   if (Frame.TileInfo.z > 0.5f)
   {
     const float occupancy = (float)tileLightCount / max((float)lightCount, 1.0f);
-    const float3 heat = float3(saturate(occupancy * 2.0f),
-                               saturate(1.0f - abs(occupancy * 2.0f - 1.0f)),
-                               saturate(1.0f - occupancy * 2.0f));
-    color = Frame.TileInfo.z > 1.5f ? heat : lerp(color, heat, 0.35f);
+    float3 heat = saturate(float3(
+      1.5f - abs(4.0f * occupancy - 3.0f),
+      1.5f - abs(4.0f * occupancy - 2.0f),
+      1.5f - abs(4.0f * occupancy - 1.0f)));
+    const bool border = ((uint)input.Position.x % 16 == 0) ||
+                        ((uint)input.Position.y % 16 == 0);
+    if (border) heat = 0.02f;
+    color = Frame.TileInfo.z < 1.5f
+      ? lerp(color, heat, border ? 0.85f : 0.55f) : heat;
   }
   return float4(color, 1.0f);
 }

@@ -19,6 +19,7 @@ struct CullPushConstants
 {
   float4x4 ViewProjection;
   uint4 Params;
+  float4 SnapMargin;
 };
 
 [[vk::push_constant]] ConstantBuffer<CullPushConstants> Cull;
@@ -31,8 +32,9 @@ struct CullPushConstants
 
 float4 MatrixRow(float4x4 matrixValue, int row)
 {
-  return float4(matrixValue[0][row], matrixValue[1][row],
-                matrixValue[2][row], matrixValue[3][row]);
+  // Slang follows HLSL indexing semantics even for the SPIR-V target: the first
+  // index selects a logical row. Column-major only controls buffer storage.
+  return matrixValue[row];
 }
 
 bool SphereVisible(float3 center, float radius)
@@ -43,7 +45,7 @@ bool SphereVisible(float3 center, float radius)
   const float4 row3 = MatrixRow(Cull.ViewProjection, 3);
   const float4 planes[6] = {
     row3 + row0, row3 - row0, row3 + row1,
-    row3 - row1, row3 + row2, row3 - row2};
+    row3 - row1, row2, row3 - row2};
   for (int planeIndex = 0; planeIndex < 6; ++planeIndex)
     if (dot(planes[planeIndex], float4(center, 1.0f)) <
         -radius * length(planes[planeIndex].xyz)) return false;
@@ -70,17 +72,23 @@ bool SphereOccluded(float3 center, float radius)
     maximumUV = max(maximumUV, uv);
     nearestDepth = min(nearestDepth, ndc.z);
   }
-  minimumUV = saturate(minimumUV - 0.002f);
-  maximumUV = saturate(maximumUV + 0.002f);
+  minimumUV = saturate(minimumUV - Cull.SnapMargin.xy);
+  maximumUV = saturate(maximumUV + Cull.SnapMargin.xy);
   const float2 extent = (maximumUV - minimumUV) * float2(Cull.Params.zw);
   if (nearestDepth <= 0.0f || max(extent.x, extent.y) < 2.0f) return false;
-  const float mip = clamp(ceil(log2(max(max(extent.x, extent.y), 1.0f))),
-                          0.0f, 15.0f);
-  const float maximumDepth = max(
-    max(HiZTexture.SampleLevel(HiZSampler, minimumUV, mip),
-        HiZTexture.SampleLevel(HiZSampler, float2(maximumUV.x, minimumUV.y), mip)),
-    max(HiZTexture.SampleLevel(HiZSampler, float2(minimumUV.x, maximumUV.y), mip),
-        HiZTexture.SampleLevel(HiZSampler, maximumUV, mip)));
+  uint width, height, levels;
+  HiZTexture.GetDimensions(0, width, height, levels);
+  const uint mip = min(uint(ceil(log2(max(max(extent.x, extent.y), 1.0f)))),
+                       levels - 1);
+  HiZTexture.GetDimensions(mip, width, height, levels);
+  const uint2 low = min(uint2(minimumUV * float2(width, height)),
+                        uint2(width - 1, height - 1));
+  const uint2 high = min(uint2(maximumUV * float2(width, height)),
+                         uint2(width - 1, height - 1));
+  float maximumDepth = 0.0f;
+  for (uint y = low.y; y <= high.y; ++y)
+    for (uint x = low.x; x <= high.x; ++x)
+      maximumDepth = max(maximumDepth, HiZTexture.Load(int3(x, y, mip)));
   return nearestDepth > maximumDepth + 0.0025f;
 }
 
@@ -92,17 +100,24 @@ void CSMain(uint3 id : SV_DispatchThreadID)
   const CullInput input = Inputs[drawIndex];
   const bool preview = (input.Metadata.w & 0x80000000u) != 0;
   uint visibleCount = 0;
-  for (uint instance = 0; instance < input.Metadata.y; ++instance)
+  const bool includeDraw = !preview || (Cull.Params.y & 2u) != 0u;
+  if (includeDraw)
   {
-    const float4x4 transform = SourceTransforms[input.Metadata.x + instance];
-    const float3 center = mul(transform, float4(input.LocalSphere.xyz, 1.0f)).xyz;
-    const float radiusScale = max(max(length(transform[0].xyz), length(transform[1].xyz)),
-                                  length(transform[2].xyz));
-    const float radius = input.LocalSphere.w * radiusScale;
-    if (!SphereVisible(center, radius)) continue;
-    if (Cull.Params.y != 0 && !preview && SphereOccluded(center, radius)) continue;
-    VisibleTransforms[input.Metadata.z + visibleCount] = transform;
-    ++visibleCount;
+    for (uint instance = 0; instance < input.Metadata.y; ++instance)
+    {
+      const float4x4 transform = SourceTransforms[input.Metadata.x + instance];
+      const float3 center = mul(transform, float4(input.LocalSphere.xyz, 1.0f)).xyz;
+      const float3 scales = float3(
+        length(float3(transform[0][0], transform[1][0], transform[2][0])),
+        length(float3(transform[0][1], transform[1][1], transform[2][1])),
+        length(float3(transform[0][2], transform[1][2], transform[2][2])));
+      const float radiusScale = max(max(scales.x, scales.y), scales.z);
+      const float radius = input.LocalSphere.w * radiusScale;
+      if (!SphereVisible(center, radius)) continue;
+      if ((Cull.Params.y & 1u) != 0u && !preview && SphereOccluded(center, radius)) continue;
+      VisibleTransforms[input.Metadata.z + visibleCount] = transform;
+      ++visibleCount;
+    }
   }
   DrawIndexedIndirectCommand command;
   command.IndexCount = input.Metadata.w & 0x7fffffffu;

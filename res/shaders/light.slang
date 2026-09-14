@@ -69,6 +69,7 @@ uniform bool u_DirectShadowsEnabled;
 uniform bool u_PointShadowsEnabled;
 uniform bool u_TiledLightingEnabled;
 uniform int u_TiledDebugMode;
+uniform float u_BloomThreshold = 1.0;
 
 const int TILE_SIZE = 16;
 const float LOCAL_LIGHT_RADIUS = 20.0;
@@ -279,7 +280,8 @@ void main()
   }
 
   float brightness = dot(result, vec3(0.2126, 0.7152, 0.0722));
-  BrightColor = brightness > 1.0 ? vec4(result, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+  BrightColor = brightness > max(u_BloomThreshold, 0.0)
+    ? vec4(result, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
   FragColor = vec4(result, 1.0);
 }
 

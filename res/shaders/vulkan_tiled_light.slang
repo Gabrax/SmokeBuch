@@ -5,9 +5,9 @@ struct SceneFrameData
   float4x4 LightViewProjection;
   float4x4 InverseViewProjection;
   float4 CameraPosition;
-  float4 LightPositions[32];
-  float4 LightDirections[32];
-  float4 LightColors[32];
+  float4 LightPositions[128];
+  float4 LightDirections[128];
+  float4 LightColors[128];
   float4 Params;
   float4 Effects;
   float4 ShadowInfo;
@@ -25,7 +25,7 @@ struct SceneFrameData
 groupshared float4 MinimumPositions[256];
 groupshared float3 MaximumPositions[256];
 groupshared uint SharedLightCount;
-groupshared uint SharedLightIndices[32];
+groupshared uint SharedLightIndices[128];
 
 [numthreads(16, 16, 1)]
 void CSMain(uint3 dispatchID : SV_DispatchThreadID,
@@ -60,7 +60,7 @@ void CSMain(uint3 dispatchID : SV_DispatchThreadID,
     GroupMemoryBarrierWithGroupSync();
   }
 
-  const uint lightCount = min((uint)Frame.Params.x, 32u);
+  const uint lightCount = min((uint)Frame.Params.x, 128u);
   if (MinimumPositions[0].w > 0.0f && lane < lightCount)
   {
     const int type = (int)Frame.LightPositions[lane].w;
@@ -72,15 +72,15 @@ void CSMain(uint3 dispatchID : SV_DispatchThreadID,
     {
       uint slot;
       InterlockedAdd(SharedLightCount, 1, slot);
-      if (slot < 32) SharedLightIndices[slot] = lane;
+      if (slot < 128) SharedLightIndices[slot] = lane;
     }
   }
   GroupMemoryBarrierWithGroupSync();
 
   const uint tileIndex = groupID.y * (uint)Frame.TileInfo.x + groupID.x;
-  const uint storedCount = min(SharedLightCount, 32u);
+  const uint storedCount = min(SharedLightCount, 128u);
   if (lane < storedCount)
-    TileIndices[tileIndex * 32 + lane] = SharedLightIndices[lane];
+    TileIndices[tileIndex * 128 + lane] = SharedLightIndices[lane];
   if (lane == 0)
-    TileGrid[tileIndex] = uint2(tileIndex * 32, storedCount);
+    TileGrid[tileIndex] = uint2(tileIndex * 128, storedCount);
 }

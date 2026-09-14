@@ -13,14 +13,26 @@
 
 #include <gabdebug.h>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <thread>
 #include <string_view>
 
 namespace
 {
+  bool HasGPUProfileTime(const GABProfileNode* node)
+  {
+    for (const GABProfileNode* current = node; current; current = current->nextSibling)
+    {
+      if (current->gpuTime > 0.0f || HasGPUProfileTime(current->firstChild))
+        return true;
+    }
+    return false;
+  }
+
   RenderEffectSettings effects;
   bool editor = false;
+  bool menuStarted = false;
   struct SmokeScene final : Scene
   {
     SmokeScene() : Scene("game") {}
@@ -31,6 +43,20 @@ namespace
       RenderBackend::Get().BeginUI();
       RenderBackend::Get().DrawText(FontManager::GetFont("dpcomic"), "Vulkan UI atlas",
         glm::vec2(180.0f, 60.0f), 0.35f, glm::vec4(1.0f));
+      RenderBackend::Get().EndUI();
+    }
+  };
+
+  struct SmokeMenuScene final : Scene
+  {
+    SmokeMenuScene() : Scene("menu") {}
+    void OnSceneStart() override { menuStarted = true; }
+    void OnUpdate(DeltaTime&) override
+    {
+      RenderSystem::PrepareScreenUI(glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+      RenderBackend::Get().BeginUI();
+      RenderBackend::Get().DrawText(FontManager::GetFont("dpcomic"), "Menu transition",
+        glm::vec2(640.0f, 360.0f), 0.35f, glm::vec4(1.0f));
       RenderBackend::Get().EndUI();
     }
   };
@@ -53,18 +79,47 @@ int main(int argc, char** argv)
   if (!backend.InitializeSceneRenderer()) return 2;
   ModelManager::Init();
   SceneManager::RegisterScene("game", [] { return std::make_unique<SmokeScene>(); });
+  SceneManager::RegisterScene("menu", [] { return std::make_unique<SmokeMenuScene>(); });
   SceneManager::LoadScene("game");
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
   uint32_t renderedFrames = 0;
   uint32_t maximumVisible = 0;
+  float maximumAspectError = 0.0f;
+  bool windowModeTransitionsPassed = true;
+  bool gpuProfilerPassed = false;
+  bool menuRequested = false;
   bool passed = true;
   while (Window::IsRunning() && renderedFrames < 160 && std::chrono::steady_clock::now() < deadline)
   {
     Window::PollEvents();
     if (Window::IsMinimized()) continue;
-    if (renderedFrames == 64) Window::SetResolution(1001, 563);
-    if (renderedFrames == 112) Window::SetResolution(1280, 720);
+    if (renderedFrames == 56)
+    {
+      Window::SetWindowMode(WindowMode::Borderless, 960, 720);
+      windowModeTransitionsPassed &=
+        glfwGetWindowAttrib(Window::GetWindowPtr(), GLFW_DECORATED) == GLFW_FALSE;
+    }
+    if (renderedFrames == 64)
+    {
+      Window::SetWindowMode(WindowMode::Windowed, 960, 720);
+      windowModeTransitionsPassed &=
+        glfwGetWindowMonitor(Window::GetWindowPtr()) == nullptr &&
+        glfwGetWindowAttrib(Window::GetWindowPtr(), GLFW_DECORATED) == GLFW_TRUE;
+    }
+    if (renderedFrames == 112)
+      Window::SetWindowMode(WindowMode::Windowed, 1280, 720);
+    if (renderedFrames == 120 && !menuRequested)
+    {
+      SceneManager::LoadScene("menu");
+      menuRequested = true;
+    }
     if (!backend.BeginFrame(Window::GetWidth(), Window::GetHeight())) { passed = false; break; }
+    const glm::mat4& projection = Camera::GetProjection();
+    const float expectedAspect = static_cast<float>(Window::GetWidth()) /
+      static_cast<float>(std::max(Window::GetHeight(), 1u));
+    const float projectionAspect = std::abs(projection[1][1] / projection[0][0]);
+    maximumAspectError = std::max(
+      maximumAspectError, std::abs(projectionAspect - expectedAspect));
     DeltaTime dt(1.0f / 60.0f);
     const bool loaded = SceneManager::GetActiveScene() && !SceneManager::IsLoading();
     if (loaded)
@@ -87,15 +142,23 @@ int main(int argc, char** argv)
       ++renderedFrames;
     }
     SceneManager::Update(dt);
+    gpuProfilerPassed |= HasGPUProfileTime(gabprofiler_get_root());
     if (editor && backend.GetAPI() == GraphicsAPI::Vulkan)
       passed &= backend.GetEditorTextureID() != 0;
     maximumVisible = std::max(maximumVisible, RenderBackend::Statistics().VisibleInstances);
     if (!backend.EndFrame(false)) { passed = false; break; }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  passed &= renderedFrames == 160 && maximumVisible > 0;
+  passed &= renderedFrames == 160 && maximumVisible > 0 &&
+    maximumAspectError < 0.001f && windowModeTransitionsPassed && menuStarted &&
+    SceneManager::GetActiveSceneName() == "menu" &&
+    (!backend.GetCapabilities().TimestampProfiler || gpuProfilerPassed);
   std::cout << GraphicsAPIName(api) << " smoke " << (passed ? "PASS" : "FAIL")
-    << ": frames=" << renderedFrames << " max-visible=" << maximumVisible << '\n';
+    << ": frames=" << renderedFrames << " max-visible=" << maximumVisible
+    << " max-aspect-error=" << maximumAspectError
+    << " window-modes=" << (windowModeTransitionsPassed ? "PASS" : "FAIL")
+    << " menu-return=" << (menuStarted ? "PASS" : "FAIL")
+    << " gpu-profiler=" << (gpuProfilerPassed ? "PASS" : "FAIL") << '\n';
   SceneManager::Shutdown();
   AudioManager::Terminate();
   ModelManager::Shutdown();

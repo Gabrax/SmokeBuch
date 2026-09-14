@@ -32,6 +32,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
+#include <gabdebug_gpu_d3d12.h>
 
 #include <imgui.h>
 #include "backends/imgui_impl_dx12.h"
@@ -222,7 +223,10 @@ namespace
     ComPtr<ID3D12GraphicsCommandList> UploadCommandList;
     ComPtr<ID3D12Fence> Fence;
     std::array<uint64_t, FrameCount> FrameFenceValues{};
+    std::array<uint64_t, FrameCount> ProfilerFenceValues{};
+    std::array<uint64_t, FrameCount> ProfilerFenceFrames{};
     uint64_t NextFenceValue = 0;
+    uint64_t ActiveProfilerFrame = std::numeric_limits<uint64_t>::max();
     HANDLE FenceEvent = nullptr;
 
     ComPtr<ID3D12RootSignature> SceneRootSignature;
@@ -303,8 +307,40 @@ namespace
     bool ImGuiInitialized = false;
     bool SceneRendererInitialized = false;
     bool UIToSceneColor = false;
+    bool ProfilerInstalled = false;
+    bool ProfilerUsed = false;
+    bool ProfilerFrameActive = false;
     bool Initialized = false;
   } s_Data;
+
+  class ScopedProfile
+  {
+  public:
+    explicit ScopedProfile(const char* name) : Scope(gabprofiler_begin(name)) {}
+    ~ScopedProfile() { gabprofiler_end(&Scope); }
+    ScopedProfile(const ScopedProfile&) = delete;
+    ScopedProfile& operator=(const ScopedProfile&) = delete;
+
+  private:
+    GABProfilerScope Scope{};
+  };
+
+  ID3D12GraphicsCommandList* ProfilerCommandList(
+    void*, uint32_t, const uint64_t frameIndex)
+  {
+    if (!s_Data.FrameStarted || !s_Data.CommandList) return nullptr;
+    s_Data.ActiveProfilerFrame = frameIndex;
+    return s_Data.CommandList.Get();
+  }
+
+  int ProfilerFrameComplete(void*, uint32_t, const uint64_t frameIndex)
+  {
+    if (!s_Data.Fence) return 0;
+    const size_t slot = static_cast<size_t>(frameIndex % FrameCount);
+    return s_Data.ProfilerFenceFrames[slot] == frameIndex &&
+           s_Data.ProfilerFenceValues[slot] != 0 &&
+           s_Data.Fence->GetCompletedValue() >= s_Data.ProfilerFenceValues[slot];
+  }
 
   [[noreturn]] void ThrowHRESULT(HRESULT result, const char* operation)
   {
@@ -545,7 +581,7 @@ namespace
       if (!mip.DescriptorIndex) mip.DescriptorIndex = AllocateDescriptor();
       mip = CreateColorTarget(std::max(1u, width >> (i + 1)),
         std::max(1u, height >> (i + 1)), BloomMipRTVBase + i, mip.DescriptorIndex,
-        DXGI_FORMAT_R11G11B10_FLOAT);
+        SceneColorFormat);
     }
     CreateGPUResources(width, height);
     s_Data.PostProcessColor = CreateColorTarget(
@@ -1299,7 +1335,7 @@ namespace
     D3D12_STATIC_SAMPLER_DESC sampler{}; sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR; sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP; sampler.MaxLOD=D3D12_FLOAT32_MAX; sampler.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rootDesc{}; rootDesc.NumParameters=static_cast<UINT>(parameters.size()); rootDesc.pParameters=parameters.data(); rootDesc.NumStaticSamplers=1; rootDesc.pStaticSamplers=&sampler; s_Data.PostRootSignature=CreateRootSignature(rootDesc);
     auto createPipeline=[&](const Shader::Bytecode& pixelShader,DXGI_FORMAT format,ComPtr<ID3D12PipelineState>& result,const char* name, bool additive=false){D3D12_GRAPHICS_PIPELINE_STATE_DESC p{};p.pRootSignature=s_Data.PostRootSignature.Get();p.VS={vs.GetBufferPointer(),vs.GetBufferSize()};p.PS={pixelShader.GetBufferPointer(),pixelShader.GetBufferSize()};p.BlendState=DefaultBlendState();if(additive){auto& b=p.BlendState.RenderTarget[0];b.BlendEnable=TRUE;b.BlendOp=b.BlendOpAlpha=D3D12_BLEND_OP_ADD;b.SrcBlend=b.DestBlend=b.SrcBlendAlpha=b.DestBlendAlpha=D3D12_BLEND_ONE;}p.SampleMask=std::numeric_limits<UINT>::max();p.RasterizerState=DefaultRasterizer();p.DepthStencilState.DepthEnable=FALSE;p.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;p.NumRenderTargets=1;p.RTVFormats[0]=format;p.SampleDesc.Count=1;CheckHRESULT(s_Data.Device->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&result)),name);};
-    createPipeline(extract,SceneColorFormat,s_Data.BloomExtractPipeline,"Create DX12 bloom extract pipeline"); createPipeline(down,DXGI_FORMAT_R11G11B10_FLOAT,s_Data.BloomDownsamplePipeline,"Create DX12 bloom downsample"); createPipeline(up,DXGI_FORMAT_R11G11B10_FLOAT,s_Data.BloomUpsamplePipeline,"Create DX12 bloom upsample",true); createPipeline(composite,SceneColorFormat,s_Data.CompositePipeline,"Create DX12 composite pipeline"); createPipeline(postProcess,BackBufferFormat,s_Data.PostProcessPipeline,"Create DX12 post-process pipeline");
+    createPipeline(extract,SceneColorFormat,s_Data.BloomExtractPipeline,"Create DX12 bloom extract pipeline"); createPipeline(down,SceneColorFormat,s_Data.BloomDownsamplePipeline,"Create DX12 bloom downsample"); createPipeline(up,SceneColorFormat,s_Data.BloomUpsamplePipeline,"Create DX12 bloom upsample",true); createPipeline(composite,SceneColorFormat,s_Data.CompositePipeline,"Create DX12 composite pipeline"); createPipeline(postProcess,BackBufferFormat,s_Data.PostProcessPipeline,"Create DX12 post-process pipeline");
   }
 
   void CreateUIPipeline()
@@ -2269,7 +2305,21 @@ bool DirectX12Renderer::Init(void* nativeWindow, uint32_t width, uint32_t height
     UpdateViewport(width, height);
     s_Data.Width = width;
     s_Data.Height = height;
+    s_Data.ProfilerFenceFrames.fill(std::numeric_limits<uint64_t>::max());
     s_Data.Initialized = true;
+    GABD3D12Config profilerConfig{};
+    profilerConfig.device = s_Data.Device.Get();
+    profilerConfig.commandQueue = s_Data.CommandQueue.Get();
+    profilerConfig.getCommandList = ProfilerCommandList;
+    profilerConfig.isFrameComplete = ProfilerFrameComplete;
+    profilerConfig.frameLatency = FrameCount;
+    profilerConfig.maxThreads = 1;
+    profilerConfig.maxScopes = 256;
+    profilerConfig.maxOccurrences = 4;
+    s_Data.ProfilerInstalled = gab_gpu_d3d12_install(&profilerConfig) != 0;
+    if (!s_Data.ProfilerInstalled)
+      gablog_log(LOG_WARN, __FILE__, __LINE__,
+        "GABDEBUG DirectX 12 GPU profiler could not be installed; CPU profiling remains active");
     gablog_log(LOG_INFO, __FILE__, __LINE__, "DirectX 12 initialized (%ux%u, tearing: %s)",
                width, height, s_Data.TearingSupported ? "supported" : "unavailable");
     return true;
@@ -2531,6 +2581,7 @@ void DirectX12Renderer::BeginImGuiFrame()
 void DirectX12Renderer::RenderImGuiDrawData()
 {
   if (!s_Data.ImGuiInitialized || !s_Data.FrameStarted || !ImGui::GetDrawData()) return;
+  ScopedProfile profile("UI PASS");
   const D3D12_CPU_DESCRIPTOR_HANDLE backBuffer = GetRTVHandle(s_Data.FrameIndex);
   s_Data.CommandList->OMSetRenderTargets(1, &backBuffer, FALSE, nullptr);
   s_Data.CommandList->RSSetViewports(1, &s_Data.Viewport);
@@ -2556,6 +2607,21 @@ void DirectX12Renderer::Shutdown()
   catch (const std::exception& error)
   {
     gablog_log(LOG_ERROR, __FILE__, __LINE__, "DirectX 12 shutdown synchronization failed: %s", error.what());
+  }
+  if (s_Data.ProfilerFrameActive)
+  {
+    gabprofiler_end_frame();
+    s_Data.ProfilerFrameActive = false;
+  }
+  if (s_Data.ProfilerUsed)
+  {
+    gabprofiler_unregister_thread();
+    s_Data.ProfilerUsed = false;
+  }
+  if (s_Data.ProfilerInstalled)
+  {
+    gabprofiler_shutdown_gpu_backend();
+    s_Data.ProfilerInstalled = false;
   }
   if (s_Data.FenceEvent)
   {
@@ -2588,6 +2654,7 @@ bool DirectX12Renderer::Resize(uint32_t width, uint32_t height)
     UpdateViewport(width, height);
     s_Data.Width = width;
     s_Data.Height = height;
+    Camera::SetViewportSize(width, height);
     return true;
   }
   catch (const std::exception& error)
@@ -2632,6 +2699,9 @@ bool DirectX12Renderer::BeginFrame()
     s_Data.PendingUIVertices.clear();
     s_Data.PendingUIBatches.clear();
     s_Data.FrameStarted = true;
+    gabprofiler_begin_frame();
+    s_Data.ProfilerUsed = true;
+    s_Data.ProfilerFrameActive = true;
     return true;
   }
   catch (const std::exception& error)
@@ -2646,7 +2716,11 @@ bool DirectX12Renderer::EndFrame(bool vSync)
   if (!s_Data.Initialized || !s_Data.FrameStarted) return false;
   try
   {
-    if (!s_Data.PendingUIVertices.empty()) EndScene();
+    if (!s_Data.PendingUIVertices.empty())
+    {
+      ScopedProfile profile("UI PASS");
+      EndScene();
+    }
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = s_Data.RenderTargets[s_Data.FrameIndex].Get();
@@ -2654,6 +2728,11 @@ bool DirectX12Renderer::EndFrame(bool vSync)
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     s_Data.CommandList->ResourceBarrier(1, &barrier);
+    if (s_Data.ProfilerFrameActive)
+    {
+      gabprofiler_end_frame();
+      s_Data.ProfilerFrameActive = false;
+    }
     CheckHRESULT(s_Data.CommandList->Close(), "ID3D12GraphicsCommandList::Close");
     ID3D12CommandList* commandLists[] = {s_Data.CommandList.Get()};
     s_Data.CommandQueue->ExecuteCommandLists(1, commandLists);
@@ -2666,6 +2745,13 @@ bool DirectX12Renderer::EndFrame(bool vSync)
     CheckHRESULT(s_Data.CommandQueue->Signal(s_Data.Fence.Get(), fenceValue),
                  "ID3D12CommandQueue::Signal");
     s_Data.FrameFenceValues[s_Data.FrameIndex] = fenceValue;
+    if (s_Data.ActiveProfilerFrame != std::numeric_limits<uint64_t>::max())
+    {
+      const size_t profilerSlot = static_cast<size_t>(
+        s_Data.ActiveProfilerFrame % FrameCount);
+      s_Data.ProfilerFenceFrames[profilerSlot] = s_Data.ActiveProfilerFrame;
+      s_Data.ProfilerFenceValues[profilerSlot] = fenceValue;
+    }
     s_Data.FrameIndex = s_Data.SwapChain->GetCurrentBackBufferIndex();
     LogD3D12Messages();
     s_Data.FrameStarted = false;
@@ -2673,6 +2759,11 @@ bool DirectX12Renderer::EndFrame(bool vSync)
   }
   catch (const std::exception& error)
   {
+    if (s_Data.ProfilerFrameActive)
+    {
+      gabprofiler_end_frame();
+      s_Data.ProfilerFrameActive = false;
+    }
     s_Data.FrameStarted = false;
     gablog_log(LOG_ERROR, __FILE__, __LINE__, "DirectX 12 presentation failed: %s", error.what());
     return false;
@@ -2684,59 +2775,92 @@ void DirectX12Renderer::DrawScene(DeltaTime& dt, const std::function<void()>& sc
                                   const RenderEffectSettings& effects)
 {
   if (!s_Data.FrameStarted || !s_Data.SceneRendererInitialized) return;
-  if (advanceSimulation) sceneLogic();
-  if (advanceSimulation)
   {
-    ModelManager::UpdateControllers(dt);
-    PhysX::Simulate(dt);
-    ModelManager::UpdateTransforms(dt);
-    Camera::OnUpdate(dt);
-    AudioManager::SetListenerLocation(Camera::GetPosition());
-    AudioManager::SetListenerOrientation(Camera::GetForwardDirection(), Camera::GetUpDirection());
-    AudioManager::UpdateAllMusic();
+    ScopedProfile profile("MISC UPDATE PASS");
+    if (advanceSimulation) sceneLogic();
+    if (advanceSimulation)
+    {
+      ModelManager::UpdateControllers(dt);
+      PhysX::Simulate(dt);
+      ModelManager::UpdateTransforms(dt);
+      Camera::OnUpdate(dt);
+      AudioManager::SetListenerLocation(Camera::GetPosition());
+      AudioManager::SetListenerOrientation(Camera::GetForwardDirection(), Camera::GetUpDirection());
+      AudioManager::UpdateAllMusic();
+    }
   }
   try
   {
-    const uint32_t shadowResolution = effects.DirectionalShadowResolution();
-    const uint32_t pointShadowResolution = effects.PointShadowResolution();
-    const bool recreateDirectionalShadow = shadowResolution != s_Data.ShadowMapSize;
-    const bool recreatePointShadow = pointShadowResolution != s_Data.PointShadowMapSize;
-    if (recreateDirectionalShadow || recreatePointShadow)
-      WaitForGPU();
-    if (recreateDirectionalShadow)
     {
-      s_Data.ShadowMap.Resource.Reset();
-      s_Data.ShadowMapReadable = false;
-      CreateShadowMap(shadowResolution);
+      ScopedProfile profile("MISC UPDATE PASS");
+      const uint32_t shadowResolution = effects.DirectionalShadowResolution();
+      const uint32_t pointShadowResolution = effects.PointShadowResolution();
+      const bool recreateDirectionalShadow = shadowResolution != s_Data.ShadowMapSize;
+      const bool recreatePointShadow = pointShadowResolution != s_Data.PointShadowMapSize;
+      if (recreateDirectionalShadow || recreatePointShadow)
+        WaitForGPU();
+      if (recreateDirectionalShadow)
+      {
+        s_Data.ShadowMap.Resource.Reset();
+        s_Data.ShadowMapReadable = false;
+        CreateShadowMap(shadowResolution);
+      }
+      if (recreatePointShadow)
+      {
+        s_Data.PointShadowMap.Resource.Reset();
+        s_Data.PointShadowDepth.Reset();
+        s_Data.PointShadowMapReadable = false;
+        CreatePointShadowMap(pointShadowResolution);
+      }
+      PrepareGPUScene(effects);
     }
-    if (recreatePointShadow)
     {
-      s_Data.PointShadowMap.Resource.Reset();
-      s_Data.PointShadowDepth.Reset();
-      s_Data.PointShadowMapReadable = false;
-      CreatePointShadowMap(pointShadowResolution);
+      ScopedProfile profile("DIRECT SHADOW PASS");
+      DrawShadowMap(effects);
     }
-    PrepareGPUScene(effects);
-    DrawShadowMap(effects);
-    DrawPointShadowMaps(effects);
-    DispatchGPUCull(false, DirectXViewProjection(), effects);
-    DrawDepthPrepass();
-    BuildHiZ();
-    DispatchGPUCull(true, DirectXViewProjection(), effects);
-    BeginGeometryPass();
-    DrawGPUScene(s_Data.ScenePipeline.Get());
-    EndGeometryPass();
-    DispatchTileLights(effects);
-    DrawLightingPass(effects);
-    CompositeLighting(effects);
-    DrawSkybox();
-    if (RenderBackend::DebugSettings().Physics) DrawPhysicsDebug();
-    DrawDebugVisualizations();
-    ParticleRenderer::UpdateAndRender(dt);
-    s_Data.UIToSceneColor = true;
-    DrawDebug2D();
-    s_Data.UIToSceneColor = false;
-    PostProcessScene(renderForEditor, effects);
+    {
+      ScopedProfile profile("OMNI SHADOW PASS");
+      DrawPointShadowMaps(effects);
+    }
+    {
+      ScopedProfile profile("GPU DEPTH PREPASS + HIZ");
+      DispatchGPUCull(false, DirectXViewProjection(), effects);
+      DrawDepthPrepass();
+      BuildHiZ();
+    }
+    {
+      ScopedProfile profile("GEOMETRY PASS");
+      DispatchGPUCull(true, DirectXViewProjection(), effects);
+      BeginGeometryPass();
+      DrawGPUScene(s_Data.ScenePipeline.Get());
+      EndGeometryPass();
+    }
+    {
+      ScopedProfile profile("TILED LIGHT CULL");
+      DispatchTileLights(effects);
+    }
+    {
+      ScopedProfile profile("LIGHT PASS");
+      DrawLightingPass(effects);
+    }
+    {
+      ScopedProfile profile("BLOOM PASS");
+      CompositeLighting(effects);
+    }
+    {
+      ScopedProfile profile("FORWARD PASS");
+      DrawSkybox();
+      if (RenderBackend::DebugSettings().Physics) DrawPhysicsDebug();
+      DrawDebugVisualizations();
+      ParticleRenderer::UpdateAndRender(dt);
+      s_Data.UIToSceneColor = true;
+      DrawDebug2D();
+      s_Data.UIToSceneColor = false;
+    }
+    {
+      ScopedProfile profile("SCENE RESULT PASS");
+      PostProcessScene(renderForEditor, effects);
+    }
   }
   catch (const std::exception& error)
   {
